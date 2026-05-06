@@ -1,0 +1,17 @@
+{
+  "name": "@thinkroid/agent-core",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Per-agent daemon for the Thinkroid-Space platform (Brain + Context Engine + Cerebellum + per-agent SQLite).",
+  "main": "src/kernel.js",
+  "bin": {
+    "agent-core-daemon": "bin/agent-core-daemon.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.9.0"
+  }
+}

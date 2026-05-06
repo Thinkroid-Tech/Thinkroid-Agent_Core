@@ -1,0 +1,9 @@
+node_modules/
+tmp/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+.DS_Store
+*.log
+coverage/

@@ -1,0 +1,17 @@
+{
+  "name": "thinkroid-memory",
+  "version": "0.1.0",
+  "description": "Independent memory module for Thinkroid Space agents — SQLite + Tag Graph",
+  "type": "module",
+  "main": "src/api.js",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.9.0"
+  }
+}
