@@ -119,7 +119,8 @@ export function validateInitPayload(msg) {
   }
   assertPathContainedInAgentDir(agentCoreDbPath, agentId, 'agentCoreDbPath');
 
-  // socketPath — ends `.sock`, parent dir exists.
+  // socketPath — ends `.sock`, parent dir exists, fits inside the
+  // 108-byte UNIX domain socket address limit.
   const { socketPath } = config;
   if (typeof socketPath !== 'string' || socketPath.length === 0) {
     throw new Error('Invalid init payload: socketPath: must be a non-empty string');
@@ -127,6 +128,18 @@ export function validateInitPayload(msg) {
   if (!socketPath.endsWith('.sock')) {
     throw new Error(
       `Invalid init payload: socketPath: must end with '.sock', got ${JSON.stringify(socketPath)}`
+    );
+  }
+  // Phase 16γ.A — UNIX domain socket addresses are bounded by `sun_path`
+  // (sys/un.h) which is 108 bytes on Linux (104 on BSD). bind(2) silently
+  // truncates anything longer, which produces baffling "no such file"
+  // failures at connect-time. We measure bytes (Buffer.byteLength), not
+  // characters, because the limit is on the on-wire address string.
+  const sockBytes = Buffer.byteLength(socketPath, 'utf8');
+  if (sockBytes > 108) {
+    throw new Error(
+      `Invalid init payload: socketPath: exceeds 108-byte UNIX socket address limit ` +
+      `(${sockBytes} bytes): ${JSON.stringify(socketPath)}`
     );
   }
   const socketParent = path.dirname(socketPath);
