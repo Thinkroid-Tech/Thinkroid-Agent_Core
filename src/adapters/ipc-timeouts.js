@@ -18,6 +18,12 @@ export const IPC_METHOD_TIMEOUTS_MS = Object.freeze({
   'daemon.ready': 30_000,
   'space.tool.invoke': 60_000,
   'chat.completion': 60_000,
+  'ce.tick': 30_000,
+  'cerebellum.l1Tick': 60_000,
+  'cerebellum.l2Tick': 120_000,
+  'memory.read': 30_000,
+  'memory.write': 30_000,
+  'session.receiveEvent': 30_000,
   '_test.echo': 5_000,
   '_test.echo_stream': 5_000,
 });
