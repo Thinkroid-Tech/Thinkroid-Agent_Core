@@ -275,14 +275,12 @@ function registerStubKernelHandlers(kernel, { agentId } = {}) {
   //     end through real `child_process.fork`).
   registerTestEchoHandlers(kernel);
 
-  // L2'.4 — real-but-stubbed `brain.chat` streaming handler. Until L3'
-  // wires the provider adapters, the handler emits a deterministic
-  // token sequence so the SSE streaming + back-pressure + cancel
-  // pipeline can be exercised end-to-end without an LLM. Test fixtures
-  // override the LLM factory; production gets the default 3-token
-  // sequence (`['Hello', ' ', 'world']`) which is enough to prove the
-  // wire is alive but never gets handed to a real user (the chat route
-  // wires the real LLM call in L3').
+  // B.2 — provider-backed `brain.chat` streaming handler. The _test.*
+  // handlers and generic fall-back stub still exist for contract tests
+  // and not-yet-implemented method families, but production brain.chat
+  // now streams through the daemon-local provider helper by default.
+  // Deterministic token sequences are test-only and require fixtures to
+  // inject `llmFactory` explicitly.
   //
   // L3'.A — bind the daemon's agentId + the local `resolveAiConfig`
   // resolver into the handler factory so each turn picks the right
