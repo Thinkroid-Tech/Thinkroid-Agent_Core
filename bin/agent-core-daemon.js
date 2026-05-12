@@ -86,6 +86,7 @@ import {
   getAthenaModeAllowlist,
 } from '../src/lib/athena-mode.js';
 import { openAgentCoreDb } from '../src/stores/agent-core-db/db.js';
+import { TokenUsageStore } from '../src/stores/agent-core-db/token-usage-store.js';
 
 // Init handshake timeout. Overridable via env var so the integration test
 // can shrink it to ~1s instead of waiting 30s for the timeout-exit-3 path.
@@ -272,12 +273,12 @@ function runStartupRecoverySweep(db) {
  * tool.*, memory.*, daemon.*).
  *
  * @param {Kernel} kernel
- * @param {{ agentId: string }} bindings — daemon-bound identity / data
+ * @param {{ agentId: string, getTokenUsageStore?: () => TokenUsageStore|null }} bindings — daemon-bound identity / data
  *   threaded into per-handler factories. Currently only `agentId` is
  *   needed (for `brain.chat`'s `resolveAiConfig` wire — Plan §L3'.3);
  *   the next sub-phases will likely add memDb / agentCoreDb here too.
  */
-function registerStubKernelHandlers(kernel, { agentId } = {}) {
+function registerStubKernelHandlers(kernel, { agentId, getTokenUsageStore = () => null } = {}) {
   // E.5 — minimal _test.* fixtures. Used by:
   //   - the in-process kernel unit tests (registered against a fresh
   //     Kernel instance via `registerTestEchoHandlers`),
@@ -302,6 +303,28 @@ function registerStubKernelHandlers(kernel, { agentId } = {}) {
   kernel.registerHandler('brain.chat', createBrainChatHandler({
     agentId,
     aiConfigResolver: resolveAiConfig,
+    onTokenUsage: (payload) => {
+      try {
+        const store = getTokenUsageStore();
+        if (store) {
+          store.record(payload.usage);
+        } else {
+          console.warn('token_usage durable record skipped: agentCoreDb not ready');
+        }
+      } catch (err) {
+        console.warn(`token_usage durable record failed: ${err?.message ?? err}`);
+      }
+      sendNotification('token_usage', payload);
+    },
+    onHookEvent: (payload) => {
+      sendNotification('hook_event', payload);
+    },
+    onDebugLog: (payload) => {
+      sendNotification('debug_log', payload);
+    },
+    onCallbackError: (method, err) => {
+      console.warn(`${method} notification callback failed: ${err?.message ?? err}`);
+    },
   }));
 
   // Generic fall-back for unimplemented methods. F-K sub-phases will
@@ -515,6 +538,7 @@ async function main() {
 
   // S7 — kernel.
   const kernel = new Kernel();
+  let tokenUsageStore = null;
   // Expose the F.3 / F.4 caches on the kernel so future sub-phase
   // handlers (brain.* / ce.*) can read the daemon's tool list, LLM
   // provider, and config snapshot through a single context object.
@@ -530,7 +554,10 @@ async function main() {
   //
   // L3'.A — pass the daemon's bound `agentId` so the brain.chat
   // factory can thread it into resolveAiConfig (Plan §L3'.3).
-  registerStubKernelHandlers(kernel, { agentId });
+  registerStubKernelHandlers(kernel, {
+    agentId,
+    getTokenUsageStore: () => tokenUsageStore,
+  });
 
   // S9 — IPC adapter. Construct now but DO NOT call `start()` yet —
   // the daemon:ready notification (S15) still flies as a plain
@@ -565,6 +592,7 @@ async function main() {
   let agentCoreDb;
   try {
     agentCoreDb = openDaemonAgentCoreDb(agentCoreDbPath);
+    tokenUsageStore = new TokenUsageStore(agentCoreDb);
   } catch (e) {
     console.error(`agentCoreDbPath open failed: ${e.message}`);
     try { memoryClient?.close?.(); } catch { /* ignore */ }

@@ -40,6 +40,8 @@
 //   - production: `bin/agent-core-daemon.js` S8 (real daemon)
 //   - tests:      `tests/fixtures/athena-brain-chat-daemon.js`
 
+import { randomUUID } from 'node:crypto';
+
 import { streamChatCompletion as defaultStreamChatCompletion } from './llm-provider/streaming-chat.js';
 import { resolveAiConfig } from './resolveAiConfig.js';
 
@@ -137,6 +139,55 @@ function createConfigUnavailableError(agentId) {
   return err;
 }
 
+function fireCallback(method, callback, payload, onCallbackError) {
+  if (typeof callback !== 'function') return;
+  try {
+    Promise.resolve(callback(payload)).catch((err) => {
+      reportCallbackError(method, err, onCallbackError);
+    });
+  } catch (err) {
+    reportCallbackError(method, err, onCallbackError);
+  }
+}
+
+function reportCallbackError(method, err, onCallbackError) {
+  if (typeof onCallbackError === 'function') {
+    try { onCallbackError(method, err); } catch { /* swallow */ }
+    return;
+  }
+  try {
+    process.stderr.write(
+      `[brain-chat-handler] ${method} callback failed: ${err?.message ?? err}\n`,
+    );
+  } catch { /* swallow */ }
+}
+
+function buildUsagePayload({
+  id,
+  agentId,
+  taskId,
+  usage,
+  resolvedConfig,
+  createdAt,
+}) {
+  const promptTokens = usage?.prompt_tokens ?? usage?.input_tokens ?? 0;
+  const completionTokens = usage?.completion_tokens ?? usage?.output_tokens ?? 0;
+  return {
+    id,
+    agentId,
+    taskId: taskId ?? null,
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: usage?.total_tokens ?? (promptTokens + completionTokens),
+    cache_creation_input_tokens: usage?.cache_creation_input_tokens ?? 0,
+    cache_read_input_tokens: usage?.cache_read_input_tokens ?? 0,
+    model: resolvedConfig?.model ?? null,
+    providerId: resolvedConfig?.providerId ?? null,
+    source: 'brain.chat',
+    createdAt,
+  };
+}
+
 /**
  * Walk an LLM token source and emit one streaming chunk per token.
  *
@@ -185,6 +236,11 @@ export async function runBrainChatTurn(llmStream, ctx, opts = {}) {
  *   agentId?: string,
  *   aiConfigResolver?: (agentId: string, options?: { configOverride?: object }) => object | undefined,
  *   includeResolvedConfigMarker?: boolean,
+ *   createUsageId?: () => string,
+ *   onTokenUsage?: (payload: object) => void|Promise<void>,
+ *   onHookEvent?: (payload: object) => void|Promise<void>,
+ *   onDebugLog?: (payload: object) => void|Promise<void>,
+ *   onCallbackError?: (method: string, err: unknown) => void,
  * }} [opts]
  * @returns {(params: any, ctx: any) => Promise<{ done: true, totalCount: number, usage?: object }>}
  */
@@ -250,6 +306,60 @@ export function createBrainChatHandler(opts = {}) {
       onPipeFull: opts.onPipeFull,
     });
     if (usage !== undefined) {
+      const agentId = boundAgentId ?? ctx?.agentId ?? null;
+      const usageId = typeof opts.createUsageId === 'function'
+        ? opts.createUsageId()
+        : randomUUID();
+      const usagePayload = buildUsagePayload({
+        id: usageId,
+        agentId,
+        taskId: safeParams.taskId ?? null,
+        usage,
+        resolvedConfig,
+        createdAt: Date.now(),
+      });
+      const notificationBase = { agentId };
+      fireCallback(
+        'token_usage',
+        opts.onTokenUsage,
+        { ...notificationBase, usage: usagePayload },
+        opts.onCallbackError,
+      );
+      fireCallback(
+        'hook_event',
+        opts.onHookEvent,
+        {
+          ...notificationBase,
+          event: {
+            type: 'brain.chat.completed',
+            source: 'brain.chat',
+            usageId,
+            taskId: usagePayload.taskId,
+            totalTokens: usagePayload.total_tokens,
+            model: usagePayload.model,
+            providerId: usagePayload.providerId,
+            createdAt: usagePayload.createdAt,
+          },
+        },
+        opts.onCallbackError,
+      );
+      fireCallback(
+        'debug_log',
+        opts.onDebugLog,
+        {
+          ...notificationBase,
+          level: 'debug',
+          message: 'brain.chat completed',
+          context: {
+            usageId,
+            taskId: usagePayload.taskId,
+            totalCount: result.totalCount,
+            model: usagePayload.model,
+            providerId: usagePayload.providerId,
+          },
+        },
+        opts.onCallbackError,
+      );
       return { ...result, usage };
     }
     return result;

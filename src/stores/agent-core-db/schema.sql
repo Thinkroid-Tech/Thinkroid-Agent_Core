@@ -70,5 +70,21 @@ CREATE TABLE IF NOT EXISTS session_history (
   UNIQUE(session_id, turn_index)
 );
 
+CREATE TABLE IF NOT EXISTS token_usage (
+  id                          TEXT PRIMARY KEY,
+  agent_id                    TEXT NOT NULL,
+  task_id                     TEXT,
+  prompt_tokens               INTEGER NOT NULL DEFAULT 0,
+  completion_tokens           INTEGER NOT NULL DEFAULT 0,
+  total_tokens                INTEGER NOT NULL DEFAULT 0,
+  cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_read_input_tokens     INTEGER NOT NULL DEFAULT 0,
+  model                       TEXT,
+  provider_id                 TEXT,
+  source                      TEXT NOT NULL DEFAULT 'brain.chat',
+  created_at                  INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_history_session ON session_history(session_id, turn_index);
 CREATE INDEX IF NOT EXISTS idx_meta_status ON session_meta(status);
+CREATE INDEX IF NOT EXISTS idx_token_usage_created_at ON token_usage(created_at);

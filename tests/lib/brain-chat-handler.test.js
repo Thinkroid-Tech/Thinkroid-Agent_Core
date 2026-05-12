@@ -277,4 +277,68 @@ describe('brain-chat handler', () => {
       signal,
     }));
   });
+
+  it('fires usage, hook, and debug callbacks without blocking the request result', async () => {
+    const usage = { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 };
+    const streamChatCompletion = vi.fn(({ onUsage }) => {
+      onUsage(usage);
+      return tokenStream(['ok']);
+    });
+    const onTokenUsage = vi.fn(() => {
+      throw new Error('duplicate subscriber failed');
+    });
+    const onHookEvent = vi.fn();
+    const onDebugLog = vi.fn();
+    const onCallbackError = vi.fn();
+    const handler = createBrainChatHandler({
+      agentId: '11111111-1111-4111-8111-111111111111',
+      aiConfigResolver: vi.fn(() => ({
+        providerId: 'provider-test',
+        model: 'gpt-test',
+      })),
+      streamChatCompletion,
+      createUsageId: () => 'usage-1',
+      onTokenUsage,
+      onHookEvent,
+      onDebugLog,
+      onCallbackError,
+    });
+
+    const { result } = await runHandler(handler, {
+      taskId: 'task-1',
+      messages: [{ role: 'user', content: 'hello' }],
+    });
+
+    expect(result).toEqual({ done: true, totalCount: 1, usage });
+    expect(onTokenUsage).toHaveBeenCalledWith({
+      agentId: '11111111-1111-4111-8111-111111111111',
+      usage: expect.objectContaining({
+        id: 'usage-1',
+        taskId: 'task-1',
+        prompt_tokens: 3,
+        completion_tokens: 2,
+        total_tokens: 5,
+        model: 'gpt-test',
+        providerId: 'provider-test',
+        source: 'brain.chat',
+      }),
+    });
+    expect(onHookEvent).toHaveBeenCalledWith({
+      agentId: '11111111-1111-4111-8111-111111111111',
+      event: expect.objectContaining({
+        type: 'brain.chat.completed',
+        usageId: 'usage-1',
+      }),
+    });
+    expect(onDebugLog).toHaveBeenCalledWith({
+      agentId: '11111111-1111-4111-8111-111111111111',
+      level: 'debug',
+      message: 'brain.chat completed',
+      context: expect.objectContaining({ usageId: 'usage-1' }),
+    });
+    expect(onCallbackError).toHaveBeenCalledWith(
+      'token_usage',
+      expect.objectContaining({ message: 'duplicate subscriber failed' }),
+    );
+  });
 });
