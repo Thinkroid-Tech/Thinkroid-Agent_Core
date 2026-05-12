@@ -133,6 +133,9 @@ export class ThinkroidMemory {
   /** @returns {boolean} */
   get isOpen() { return this._db !== null; }
 
+  /** @returns {import('better-sqlite3').Database|null} */
+  get db() { return this._db; }
+
   /** @returns {ReadOnlyView} */
   viewForReadOnly() { return new ReadOnlyView(this._db); }
 

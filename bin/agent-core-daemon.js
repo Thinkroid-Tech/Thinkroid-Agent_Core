@@ -61,8 +61,8 @@ process.once('SIGTERM', () => {
 
 import fs from 'node:fs';
 import path from 'node:path';
-import Database from 'better-sqlite3';
 
+import { ThinkroidMemory } from '../modules/thinkroid-memory/src/api.js';
 import { Kernel } from '../src/kernel.js';
 import { DaemonIpcAdapter } from '../src/adapters/ipc.js';
 import { RestStubServer } from '../src/adapters/rest-stub-server.js';
@@ -84,6 +84,7 @@ import {
   setAthenaMode,
   getAthenaModeAllowlist,
 } from '../src/lib/athena-mode.js';
+import { openAgentCoreDb } from '../src/stores/agent-core-db/db.js';
 
 // Init handshake timeout. Overridable via env var so the integration test
 // can shrink it to ~1s instead of waiting 30s for the timeout-exit-3 path.
@@ -201,26 +202,36 @@ async function startRestStubServer(socketPath) {
 }
 
 /**
- * S11 / S12 — open existing SQLite file. Per ADR §1.3 DB Bootstrap
- * Ownership, the Space `hire_agent` flow creates the file; the daemon
- * never lazy-creates it. Missing file → exit 6 with reason
- * `sqlite_open_missing_db`.
+ * S11 — open or create daemon-owned memory.db. Phase 16γ.B.3 moves
+ * per-agent DB bootstrap ownership into the daemon: a clean office can
+ * start with only the agent directory present, and this helper creates
+ * the file + applies the memory schema through ThinkroidMemory.open().
+ *
+ * @param {string} dbPath
+ * @param {string} agentId
+ * @returns {{ memory: ThinkroidMemory, db: import('better-sqlite3').Database }}
+ */
+function openDaemonMemoryDb(dbPath, agentId) {
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  const memory = new ThinkroidMemory(dbPath, agentId);
+  memory.open();
+  const db = memory.db;
+  if (!db) {
+    throw new Error(`ThinkroidMemory did not expose an open DB handle: ${dbPath}`);
+  }
+  return { memory, db };
+}
+
+/**
+ * S12 — open or create daemon-owned agent-core.db. Uses the shared
+ * agent-core DB helper so fresh boots and restarts both apply schema
+ * and status migration consistently.
  *
  * @param {string} dbPath
  * @returns {import('better-sqlite3').Database}
  */
-function openExistingSqliteDb(dbPath) {
-  if (!fs.existsSync(dbPath)) {
-    throw new Error(`SQLite file does not exist: ${dbPath}`);
-  }
-  // `fileMustExist: true` is belt-and-braces: even if the file is
-  // racy-deleted between existsSync and the open, better-sqlite3 raises
-  // SQLITE_CANTOPEN instead of silently re-creating it.
-  const db = new Database(dbPath, { fileMustExist: true });
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
-  db.pragma('busy_timeout = 5000');
-  return db;
+function openDaemonAgentCoreDb(dbPath) {
+  return openAgentCoreDb(dbPath);
 }
 
 /**
@@ -537,22 +548,25 @@ async function main() {
     process.exit(5);
   }
 
-  // S11 — open memory.db (existing-only).
+  // S11 — open/create daemon-owned memory.db.
   let memDb;
+  let memoryClient;
   try {
-    memDb = openExistingSqliteDb(memoryDbPath);
+    const opened = openDaemonMemoryDb(memoryDbPath, agentId);
+    memoryClient = opened.memory;
+    memDb = opened.db;
   } catch (e) {
     console.error(`memoryDbPath open failed: ${e.message}`);
     process.exit(6);
   }
 
-  // S12 — open agent-core.db (existing-only).
+  // S12 — open/create daemon-owned agent-core.db.
   let agentCoreDb;
   try {
-    agentCoreDb = openExistingSqliteDb(agentCoreDbPath);
+    agentCoreDb = openDaemonAgentCoreDb(agentCoreDbPath);
   } catch (e) {
     console.error(`agentCoreDbPath open failed: ${e.message}`);
-    try { memDb.close(); } catch { /* ignore */ }
+    try { memoryClient?.close?.(); } catch { /* ignore */ }
     process.exit(6);
   }
 
@@ -615,7 +629,7 @@ async function main() {
       try { ipcAdapter?.stop?.(); } catch { /* ignore close errors on shutdown */ }
       try { await restServer?.stop(); } catch { /* ignore close errors on shutdown */ }
       try { agentCoreDb?.close(); } catch { /* ignore close errors on shutdown */ }
-      try { memDb?.close(); } catch { /* ignore close errors on shutdown */ }
+      try { memoryClient?.close?.(); } catch { /* ignore close errors on shutdown */ }
     },
   });
 
