@@ -80,6 +80,7 @@ import { createToolInvokeHandler } from '../src/lib/daemon-tool-invoke.js';
 import { createThinkDeeper } from '../src/lib/daemon-ce-stage-4.js';
 import { createBrainChatHandler } from '../src/lib/brain-chat-handler.js';
 import { resolveAiConfig, setAiConfig } from '../src/lib/resolveAiConfig.js';
+import { registerDaemonIpcHandlers } from '../src/handlers/daemon-ipc-handlers.js';
 import {
   setAthenaMode,
   getAthenaModeAllowlist,
@@ -611,6 +612,18 @@ async function main() {
     agentName: config.agentName ?? null,
   });
   kernel.registerHandler('tool.invoke', toolInvokeHandler);
+
+  // γ.B.3 Task 5 — register daemon-owned IPC handlers only after all
+  // daemon DB handles are open. These handlers use memoryClient/memDb
+  // and agentCoreDb directly; registering earlier would expose request
+  // methods before their backing stores exist.
+  registerDaemonIpcHandlers(kernel, {
+    agentId,
+    agentName: config.agentName ?? null,
+    memoryClient,
+    memDb,
+    agentCoreDb,
+  });
 
   // S6b — Full SIGTERM handler (M51). Replaces the S6a early stub.
   // We install the full version after the DB handles exist so the
