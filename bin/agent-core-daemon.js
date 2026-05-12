@@ -651,6 +651,9 @@ async function main() {
     memoryClient,
     memDb,
     agentCoreDb,
+    ipcAdapter,
+    toolRegistry,
+    brainConfig: config.brainConfig ?? null,
   });
 
   // S6b — Full SIGTERM handler (M51). Replaces the S6a early stub.

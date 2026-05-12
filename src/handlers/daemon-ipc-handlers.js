@@ -6,8 +6,14 @@ import {
 } from '../ipc/agent-core-contract.js';
 import { CerebellumL1 } from '../cerebellum/layer1.js';
 import { CerebellumL2 } from '../cerebellum/layer2.js';
+import { ContextEngine } from '../ce/context-engine.js';
+import { Brain } from '../brain/brain.js';
+import { Supervisor } from '../supervisor/index.js';
 import { SessionMetaStore } from '../stores/agent-core-db/session-meta-store.js';
 import { SessionHistoryStore } from '../stores/agent-core-db/session-history-store.js';
+import { AgentConfigStore } from '../stores/agent-core-db/agent-config-store.js';
+import { streamChatCompletion as defaultStreamChatCompletion } from '../lib/llm-provider/streaming-chat.js';
+import { resolveAiConfig } from '../lib/resolveAiConfig.js';
 
 const MEMORY_LAYERS = new Set(['short', 'long', 'short_skill', 'long_skill']);
 const CONFIDENCE_LEVELS = new Set(['high', 'medium', 'low']);
@@ -126,6 +132,154 @@ function pickCerebellumL2Settings(settings) {
   return out;
 }
 
+export function createDaemonBuildSystemPrompt({ ipcAdapter, agentId, agentName }) {
+  return async function buildSystemPromptViaSpace({
+    sceneId,
+    dynamicData = {},
+    contextParams = null,
+  } = {}) {
+    if (!ipcAdapter || typeof ipcAdapter.request !== 'function') {
+      throw new Error('daemon session runtime requires ipcAdapter.request for space.scene.render');
+    }
+
+    const rendered = await ipcAdapter.request(
+      'space.scene.render',
+      {
+        agentId,
+        agentName,
+        sceneId,
+        dynamicData: dynamicData || {},
+        contextParams: contextParams || null,
+      },
+      { timeoutMs: 30000 },
+    );
+
+    if (
+      !rendered ||
+      typeof rendered !== 'object' ||
+      typeof rendered.system !== 'string' ||
+      typeof rendered.user !== 'string'
+    ) {
+      throw new Error('space.scene.render returned invalid prompt payload: expected { system: string, user: string }');
+    }
+
+    return rendered;
+  };
+}
+
+function createDaemonTextChat({
+  agentId,
+  brainConfig,
+  aiConfigResolver = resolveAiConfig,
+  streamChatCompletion = defaultStreamChatCompletion,
+} = {}) {
+  return async function daemonTextChat({
+    messages,
+    maxTokens,
+    max_tokens: maxTokensSnake,
+    configOverride,
+  } = {}) {
+    const hasConfigOverride = configOverride !== undefined && configOverride !== null;
+    const resolvedConfig =
+      aiConfigResolver(agentId, hasConfigOverride ? { configOverride } : undefined) ??
+      (hasConfigOverride ? configOverride : brainConfig);
+
+    if (!resolvedConfig || typeof resolvedConfig !== 'object') {
+      throw new Error(
+        `daemon_ai_config_unavailable: no cached config for agentId='${agentId}' and no configOverride supplied`,
+      );
+    }
+
+    let text = '';
+    const stream = streamChatCompletion({
+      config: resolvedConfig,
+      messages,
+      maxTokens: maxTokens ?? maxTokensSnake ?? resolvedConfig.maxTokens,
+    });
+    for await (const token of stream) {
+      if (typeof token === 'string') text += token;
+    }
+    return text;
+  };
+}
+
+export function createDaemonSessionRuntime({
+  agentId,
+  agentName,
+  memoryClient,
+  agentCoreDb,
+  ipcAdapter,
+  toolRegistry,
+  brainConfig,
+  aiConfigResolver,
+  streamChatCompletion,
+  textChat,
+} = {}) {
+  if (!agentId) throw new TypeError('createDaemonSessionRuntime requires agentId');
+  if (!memoryClient || typeof memoryClient.viewForCeAccess !== 'function') {
+    throw new TypeError('createDaemonSessionRuntime requires memoryClient');
+  }
+  if (!agentCoreDb) throw new TypeError('createDaemonSessionRuntime requires agentCoreDb');
+
+  const metaStore = new SessionMetaStore(agentCoreDb);
+  const historyStore = new SessionHistoryStore(agentCoreDb);
+  const agentConfigStore = new AgentConfigStore(agentCoreDb);
+  const daemonTextChat = typeof textChat === 'function'
+    ? textChat
+    : createDaemonTextChat({
+      agentId,
+      brainConfig,
+      aiConfigResolver,
+      streamChatCompletion,
+    });
+
+  const ce = new ContextEngine({
+    agentId,
+    agentName,
+    ceAccessView: memoryClient.viewForCeAccess({
+      selectedIncrement: 2,
+      seenIncrement: 1,
+    }),
+    metaStore,
+    historyStore,
+    ceChannel: async (params = {}) => daemonTextChat({
+      ...params,
+      tools: [],
+    }),
+    buildSystemPrompt: createDaemonBuildSystemPrompt({
+      ipcAdapter,
+      agentId,
+      agentName,
+    }),
+    getToolsForAgent: () => (
+      toolRegistry && typeof toolRegistry.getForLlm === 'function'
+        ? toolRegistry.getForLlm()
+        : []
+    ),
+    agentManager: {
+      getPersonality: async () => agentConfigStore.get('personality') ?? '',
+    },
+  });
+
+  const brain = new Brain({
+    agentId,
+    agentName,
+    callAIWithTools: daemonTextChat,
+    providerType: brainConfig?.providerType ?? brainConfig?.provider ?? 'openai-compatible',
+  });
+
+  return new Supervisor({
+    agentId,
+    ce,
+    brain,
+    sessionMetaStore: metaStore,
+    sessionHistoryStore: historyStore,
+    config: {
+      providerType: brainConfig?.providerType ?? brainConfig?.provider,
+    },
+  });
+}
+
 export function createCeTickHandler({ agentId }) {
   return async (params) => {
     const method = 'ce.tick';
@@ -234,11 +388,26 @@ export function createCerebellumL2TickHandler({
   };
 }
 
-export function createSessionReceiveEventHandler({ agentId }) {
+export function createSessionReceiveEventHandler({ agentId, createSessionRuntime, ...runtimeDeps }) {
+  let supervisor = null;
   return async (params) => {
     const method = 'session.receiveEvent';
     validateRequest(method, params, agentId);
-    return { ok: false, accepted: false, reason: 'not_ready' };
+    if (!supervisor) {
+      supervisor = typeof createSessionRuntime === 'function'
+        ? createSessionRuntime({ agentId, ...runtimeDeps })
+        : createDaemonSessionRuntime({ agentId, ...runtimeDeps });
+      if (!supervisor || typeof supervisor.receiveEvent !== 'function') {
+        rejectApplication(method, 'daemon session runtime did not provide Supervisor.receiveEvent');
+      }
+    }
+
+    const result = await supervisor.receiveEvent(params.event, params.options ?? {});
+    return validateResponse(method, {
+      ...(result && typeof result === 'object' ? result : {}),
+      ok: true,
+      accepted: true,
+    });
   };
 }
 

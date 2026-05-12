@@ -5,7 +5,10 @@ import path from 'node:path';
 
 import { Kernel } from '../../src/kernel.js';
 import { IPC_ERROR_CODES } from '../../src/adapters/ipc-errors.js';
-import { registerDaemonIpcHandlers } from '../../src/handlers/daemon-ipc-handlers.js';
+import {
+  createDaemonBuildSystemPrompt,
+  registerDaemonIpcHandlers,
+} from '../../src/handlers/daemon-ipc-handlers.js';
 import { ThinkroidMemory } from '../../modules/thinkroid-memory/src/api.js';
 import { openAgentCoreDb } from '../../src/stores/agent-core-db/db.js';
 import { SessionMetaStore } from '../../src/stores/agent-core-db/session-meta-store.js';
@@ -17,7 +20,7 @@ const OTHER_AGENT_ID = '22222222-2222-4222-8222-222222222222';
 
 const tempDirs = new Set();
 
-function makeDeps() {
+function makeDeps(overrides = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-core-ipc-'));
   tempDirs.add(dir);
 
@@ -32,6 +35,7 @@ function makeDeps() {
     memoryClient,
     memDb: memoryClient.db,
     agentCoreDb,
+    ...overrides,
   });
 
   return { kernel, memoryClient, agentCoreDb };
@@ -81,7 +85,7 @@ afterEach(() => {
 });
 
 describe('daemon IPC handlers', () => {
-  it('registers locked daemon-side methods including session.receiveEvent skeleton', async () => {
+  it('registers locked daemon-side methods including session.receiveEvent runtime', async () => {
     const { kernel, memoryClient, agentCoreDb } = makeDeps();
     try {
       expect(kernel.listMethods()).toEqual([
@@ -100,15 +104,147 @@ describe('daemon IPC handlers', () => {
           skipped: true,
           reason: 'no_scheduled_ce_work',
         });
-
-      await expect(kernel.dispatch('session.receiveEvent', {
-        agentId: AGENT_ID,
-        event: { type: 'user.message' },
-      })).resolves.toEqual({ ok: false, accepted: false, reason: 'not_ready' });
     } finally {
       agentCoreDb.close();
       memoryClient.close();
     }
+  });
+
+  it('routes session.receiveEvent through the lazy daemon supervisor runtime', async () => {
+    const supervisor = {
+      receiveEvent: vi.fn(async () => ({
+        action: 'create_session',
+        session_id: 'session-runtime-1',
+        brainResponse: 'daemon reply',
+      })),
+    };
+    const createSessionRuntime = vi.fn(() => supervisor);
+    const { kernel, memoryClient, agentCoreDb } = makeDeps({ createSessionRuntime });
+
+    try {
+      await expect(kernel.dispatch('session.receiveEvent', {
+        agentId: AGENT_ID,
+        event: { type: 'user.message', payload: { content: 'hello' } },
+        options: { sceneId: 'chat', dynamicData: { mood: 'focused' } },
+      })).resolves.toEqual({
+        ok: true,
+        accepted: true,
+        action: 'create_session',
+        session_id: 'session-runtime-1',
+        brainResponse: 'daemon reply',
+      });
+
+      expect(createSessionRuntime).toHaveBeenCalledTimes(1);
+      expect(supervisor.receiveEvent).toHaveBeenCalledWith(
+        { type: 'user.message', payload: { content: 'hello' } },
+        { sceneId: 'chat', dynamicData: { mood: 'focused' } },
+      );
+    } finally {
+      agentCoreDb.close();
+      memoryClient.close();
+    }
+  });
+
+  it('builds a text-only daemon Supervisor runtime for session.receiveEvent', async () => {
+    const ipcAdapter = {
+      request: vi.fn(async () => ({
+        system: 'Runtime system prompt',
+        user: 'Runtime user prompt',
+      })),
+    };
+    const toolRegistry = {
+      getForLlm: vi.fn(() => [{
+        type: 'function',
+        function: {
+          name: 'remote_tool',
+          description: 'Must not be passed to the Task 9 text shim provider call.',
+          parameters: { type: 'object', properties: {} },
+        },
+      }]),
+    };
+    const providerCalls = [];
+    const streamChatCompletion = vi.fn(async function* fakeTextOnlyProvider(params) {
+      providerCalls.push(params);
+      yield 'runtime ';
+      yield 'brain reply';
+    });
+    const { kernel, memoryClient, agentCoreDb } = makeDeps({
+      ipcAdapter,
+      toolRegistry,
+      brainConfig: {
+        provider: 'openai-compatible',
+        model: 'test-model',
+        apiKey: 'test-key',
+        baseUrl: 'http://example.invalid/v1',
+      },
+      streamChatCompletion,
+    });
+
+    try {
+      const result = await kernel.dispatch('session.receiveEvent', {
+        agentId: AGENT_ID,
+        event: { type: 'user.message', payload: { content: 'hello runtime' } },
+        options: { sceneId: 'chat' },
+      });
+
+      expect(result).toMatchObject({
+        ok: true,
+        accepted: true,
+        action: 'create_session',
+        brainResponse: 'runtime brain reply',
+      });
+      expect(result.session_id).toEqual(expect.any(String));
+      expect(ipcAdapter.request).toHaveBeenCalledWith(
+        'space.scene.render',
+        expect.objectContaining({
+          agentId: AGENT_ID,
+          agentName: 'Daemon Alice',
+          sceneId: 'chat',
+        }),
+        { timeoutMs: 30000 },
+      );
+      expect(toolRegistry.getForLlm).toHaveBeenCalled();
+      expect(streamChatCompletion).toHaveBeenCalled();
+      expect(providerCalls[0]).not.toHaveProperty('tools');
+    } finally {
+      agentCoreDb.close();
+      memoryClient.close();
+    }
+  });
+
+  it('builds system prompts through space.scene.render IPC', async () => {
+    const ipcAdapter = {
+      request: vi.fn(async () => ({
+        system: 'Rendered system prompt',
+        user: 'Rendered user prompt',
+      })),
+    };
+    const buildSystemPrompt = createDaemonBuildSystemPrompt({
+      ipcAdapter,
+      agentId: AGENT_ID,
+      agentName: 'Daemon Alice',
+    });
+
+    await expect(buildSystemPrompt({
+      sceneId: 'chat',
+      dynamicData: { foo: 'bar' },
+      contextParams: { source: 'test' },
+    })).resolves.toEqual({
+      system: 'Rendered system prompt',
+      user: 'Rendered user prompt',
+    });
+
+    expect(ipcAdapter.request).toHaveBeenCalledWith(
+      'space.scene.render',
+      {
+        agentId: AGENT_ID,
+        agentName: 'Daemon Alice',
+        sceneId: 'chat',
+        dynamicData: { foo: 'bar' },
+        contextParams: { source: 'test' },
+      },
+      { timeoutMs: 30000 },
+    );
   });
 
   it('rejects malformed payloads and mismatched agent IDs as application errors', async () => {
@@ -125,6 +261,17 @@ describe('daemon IPC handlers', () => {
       await expectJsonRpcApplicationError(
         kernel.dispatch('memory.write', { agentId: AGENT_ID, entries: [{ content: ' ' }] }),
         'entries[0].content must be a non-empty string',
+      );
+      await expectJsonRpcApplicationError(
+        kernel.dispatch('session.receiveEvent', { agentId: AGENT_ID, event: { type: '' } }),
+        'event.type must be a non-empty string',
+      );
+      await expectJsonRpcApplicationError(
+        kernel.dispatch('session.receiveEvent', {
+          agentId: OTHER_AGENT_ID,
+          event: { type: 'user.message' },
+        }),
+        'agentId mismatch',
       );
     } finally {
       agentCoreDb.close();
