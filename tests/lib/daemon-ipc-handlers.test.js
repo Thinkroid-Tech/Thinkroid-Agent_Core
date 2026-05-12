@@ -10,6 +10,7 @@ import { ThinkroidMemory } from '../../modules/thinkroid-memory/src/api.js';
 import { openAgentCoreDb } from '../../src/stores/agent-core-db/db.js';
 import { SessionMetaStore } from '../../src/stores/agent-core-db/session-meta-store.js';
 import { SessionHistoryStore } from '../../src/stores/agent-core-db/session-history-store.js';
+import { CerebellumL2 } from '../../src/cerebellum/layer2.js';
 
 const AGENT_ID = '11111111-1111-4111-8111-111111111111';
 const OTHER_AGENT_ID = '22222222-2222-4222-8222-222222222222';
@@ -298,6 +299,56 @@ describe('daemon IPC handlers', () => {
     try {
       await expect(kernel.dispatch('cerebellum.l2Tick', { agentId: AGENT_ID }))
         .resolves.toEqual({ ok: true, processed: false, skipped: false });
+    } finally {
+      agentCoreDb.close();
+      memoryClient.close();
+    }
+  });
+
+  it('passes validated L2 settings into CerebellumL2 constructor', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-core-ipc-'));
+    tempDirs.add(dir);
+    const memoryClient = new ThinkroidMemory(path.join(dir, 'memory.db'), AGENT_ID);
+    memoryClient.open();
+    const agentCoreDb = openAgentCoreDb(path.join(dir, 'agent-core.db'));
+    const kernel = new Kernel();
+    const observed = [];
+    const tickSpy = vi
+      .spyOn(CerebellumL2.prototype, 'tick')
+      .mockImplementation(function captureConstructorOptions() {
+        observed.push({
+          pruneThreshold: this._pruneThreshold,
+          promotionThresholds: this._promotionThresholds,
+          arbitrary: this.arbitrary,
+        });
+        return Promise.resolve();
+      });
+
+    registerDaemonIpcHandlers(kernel, {
+      agentId: AGENT_ID,
+      agentName: 'Daemon Alice',
+      memoryClient,
+      memDb: memoryClient.db,
+      agentCoreDb,
+      cerebellumChannel: vi.fn(async () => '[none]'),
+    });
+
+    try {
+      await expect(kernel.dispatch('cerebellum.l2Tick', {
+        agentId: AGENT_ID,
+        settings: {
+          pruneThreshold: 0.42,
+          promotionThresholds: { short: 4, short_skill: 9 },
+          arbitrary: 'must-not-be-forwarded',
+        },
+      })).resolves.toEqual({ ok: true, processed: false, skipped: false });
+
+      expect(tickSpy).toHaveBeenCalledTimes(1);
+      expect(observed).toEqual([{
+        pruneThreshold: 0.42,
+        promotionThresholds: { short: 4, short_skill: 9 },
+        arbitrary: undefined,
+      }]);
     } finally {
       agentCoreDb.close();
       memoryClient.close();

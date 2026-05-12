@@ -114,6 +114,18 @@ function hasPendingL2Work({ agentId, metaStore, historyStore }) {
     ));
 }
 
+function pickCerebellumL2Settings(settings) {
+  if (!settings || typeof settings !== 'object') return {};
+  const out = {};
+  if (Object.prototype.hasOwnProperty.call(settings, 'pruneThreshold')) {
+    out.pruneThreshold = settings.pruneThreshold;
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, 'promotionThresholds')) {
+    out.promotionThresholds = settings.promotionThresholds;
+  }
+  return out;
+}
+
 export function createCeTickHandler({ agentId }) {
   return async (params) => {
     const method = 'ce.tick';
@@ -215,6 +227,7 @@ export function createCerebellumL2TickHandler({
       metaStore,
       historyStore,
       cerebellumChannel,
+      ...pickCerebellumL2Settings(params.settings),
     });
     await l2.tick();
     return validateResponse(method, { ok: true, processed, skipped: false });
