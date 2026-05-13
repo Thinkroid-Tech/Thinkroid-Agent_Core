@@ -1,30 +1,27 @@
-// Phase 16.G.1 — Daemon-side `tool.invoke` kernel handler.
+// Daemon-side `tool.invoke` kernel handler.
 //
-// Replaces the S8 `_stubHandler` for the `tool.invoke` method with a
-// real dispatcher that:
+// Dispatcher behaviour:
 //
 //   1. Looks up the tool definition in the daemon's tool registry
-//      (F.3 — populated from the init payload `toolList` plus
-//      runtime `tool:added` / `tool:removed` push notifications).
+//      (populated from the init payload `toolList` plus runtime
+//      `tool:added` / `tool:removed` push notifications).
 //   2. Discriminates on `tool.executor`:
 //        - 'local'  → invoke the daemon-internal handler directly
-//                     (recall now, mem:* in future sub-phases),
-//        - 'remote' → (sub-phase H) delegate to Space via IPC
-//                     `space.tool.invoke`. Class A tool-level errors
-//                     pass through unchanged; Class B transport errors
-//                     are wrapped into the daemon-side tool-result
-//                     envelope so the LLM tool-loop sees a uniform
-//                     `{ content, isToolError? }` shape regardless of
-//                     where the failure originated (Design §6.4 / Q11).
+//                     (recall now, mem:* in future iterations),
+//        - 'remote' → delegate to Space via IPC `space.tool.invoke`.
+//                     Class A tool-level errors pass through unchanged;
+//                     Class B transport errors are wrapped into the
+//                     daemon-side tool-result envelope so the LLM
+//                     tool-loop sees a uniform `{ content, isToolError? }`
+//                     shape regardless of where the failure originated.
 //   3. Wraps the local-tool result into the `{ result }` envelope the
 //      tool-loop layer expects.
 //
-// Per ADR §4 / §5 the daemon owns this dispatcher outright for local
-// tools. For remote tools the daemon round-trips back through the
-// SpaceIpcAdapter to a single Space-side kernel that hosts the
-// `space.tool.invoke` handler (H.2). The Space-side supervisor still
-// only ships tool *definitions* to the daemon at init; the actual
-// executor closures stay in the Space process.
+// The daemon owns this dispatcher outright for local tools. For remote
+// tools the daemon round-trips back through the SpaceIpcAdapter to a
+// single Space-side kernel that hosts the `space.tool.invoke` handler.
+// The Space-side supervisor still only ships tool *definitions* to the
+// daemon at init; the actual executor closures stay in the Space process.
 
 import { internalToolRegistry } from '../brain/internal-tools/index.js';
 import { throwJsonRpcError } from '../kernel.js';
@@ -34,10 +31,9 @@ import { IPC_METHOD_TIMEOUTS_MS } from '../adapters/ipc-timeouts.js';
 /**
  * Build the `tool.invoke` kernel handler. The factory binds the daemon's
  * tool registry + the runtime context the local tools need (memDb /
- * agentCoreDb handles, the CE Stage 4 `thinkDeeper` closure, etc.) plus,
- * for sub-phase H, the IPC adapter handle the dispatcher uses to
- * round-trip remote tool calls back to Space's `space.tool.invoke`
- * kernel handler.
+ * agentCoreDb handles, the `thinkDeeper` closure, etc.) plus the IPC
+ * adapter handle the dispatcher uses to round-trip remote tool calls
+ * back to Space's `space.tool.invoke` kernel handler.
  *
  * @param {{
  *   toolRegistry: { getAll: () => Array<object> },
@@ -122,19 +118,27 @@ export function createToolInvokeHandler({
 }
 
 /**
- * Sub-phase H — delegate a remote tool call back to Space via IPC.
+ * Delegate a remote tool call back to Space via IPC.
  *
- * Wire contract (Design §6.4 / Q11 / M10 v2):
+ * Wire contract:
  *
  *   - On success the Space-side handler returns a tool-result envelope:
  *
- *       { content: '<text>' }                        // Class A success
- *       { content: '<error message>', isToolError: true }  // Class A
+ *       { content: '<text>' }                                  // Class A success
+ *       { content: '<error message>', isToolError: true }      // Class A tool error
  *
- *     Both shapes carry an OK transport (the IPC envelope's `result`
- *     field is the envelope above), so they pass through to the daemon-
- *     side LLM tool-loop verbatim. The LLM sees the same
+ *     Both shapes carry an OK transport, so they pass through to the
+ *     daemon-side LLM tool-loop verbatim. The LLM sees the same
  *     `{ content, isToolError? }` shape it expects from local tools.
+ *
+ *   - Approval-pending envelope (new, daemon→Space tool callback bridge):
+ *
+ *       { ok: false, code: 'APPROVAL_PENDING', approvalId, name, args }
+ *
+ *     Returned verbatim. A future tool-loop handler consumes this
+ *     directly to persist suspension state; existing `tool.invoke`
+ *     callers (text-only paths) do not invoke approval-bearing tools
+ *     and therefore never observe this shape in practice.
  *
  *   - Class B transport errors (no live daemon ↔ space, missing
  *     handler, internal Space crash) surface as a JsonRpcError throw
@@ -151,7 +155,10 @@ export function createToolInvokeHandler({
  *   agentId: string|null,
  *   agentName: string|null,
  * }} deps
- * @returns {Promise<{ content: string, isToolError?: boolean }>}
+ * @returns {Promise<
+ *   { content: string, isToolError?: boolean }
+ *   | { ok: false, code: string, approvalId?: string, name?: string, args?: object }
+ * >}
  */
 async function invokeRemoteTool({
   toolName,
@@ -196,6 +203,31 @@ async function invokeRemoteTool({
         isToolError: true,
       };
     }
+    // Recognise the daemon→Space tool callback approval bridge envelope
+    // (`{ ok: false, code: 'APPROVAL_PENDING', approvalId, name, args }`)
+    // and surface it as-is to the caller. The future tool-loop handler
+    // consumes this directly to persist suspension state; current
+    // `tool.invoke` callers do not invoke approval-bearing tools, so
+    // they never see this shape in practice. Note that to a legacy
+    // caller expecting `{ content, isToolError? }` this envelope reads
+    // as "unrecognised" — intentional: the legacy callers can't act on
+    // a pending approval anyway, and shape-matching it here is the
+    // contract pivot the new tool-loop relies on.
+    if (
+      result.ok === false &&
+      typeof result.code === 'string' &&
+      result.code === 'APPROVAL_PENDING'
+    ) {
+      return result;
+    }
+    // Defensive shape-guard: any other `{ ok: false }` payload (with or
+    // without a `code` field) is returned verbatim too — never coerced
+    // into a phoney `{ content }` envelope. This keeps room for future
+    // structured-error codes without forcing them through a
+    // tool-result re-wrap.
+    if (result.ok === false) {
+      return result;
+    }
     return result;
   } catch (err) {
     // Class B transport-level error — wrap into Class A so the LLM
@@ -237,9 +269,9 @@ async function invokeLocalTool({ toolName, args, callerCtx, kernelCtx, localCont
   }
 
   // Build the toolContext the internal-tool handler closure expects.
-  // recall.js reads `ctx.thinkDeeper` (CE Stage 4 accessor); future
-  // mem:* tools read `ctx.memDb` / `ctx.agentCoreDb`. Caller-supplied
-  // ctx fields override daemon defaults so a Space-side caller can pass
+  // recall.js reads `ctx.thinkDeeper`; future mem:* tools read
+  // `ctx.memDb` / `ctx.agentCoreDb`. Caller-supplied ctx fields
+  // override daemon defaults so a Space-side caller can pass
   // session-scoped context (sessionId, turnId, etc.) through unchanged.
   const toolCtx = {
     ...localContext,
