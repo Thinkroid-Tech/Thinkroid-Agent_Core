@@ -26,6 +26,7 @@ describe('agent-core IPC contract', () => {
       'memory.read',
       'memory.write',
       'session.receiveEvent',
+      'governance.delegate',
     ]);
 
     expect(listNotificationMethods()).toEqual([
@@ -207,6 +208,369 @@ describe('agent-core IPC contract', () => {
     })).toEqual({
       ok: false,
       errors: ['agentId must be a UUID string'],
+    });
+  });
+
+  describe('governance.delegate contract', () => {
+    const validMessages = [
+      { role: 'system', content: 'You are a governance reviewer.' },
+      { role: 'user', content: 'Decide whether to NOTIFY or SKIP.' },
+    ];
+
+    const validBase = {
+      agentId: AGENT_ID,
+      capability: 'notification_reader',
+      promptKey: 'notification_reader.decide',
+      messages: validMessages,
+      source: 'governanceRouter.notification_reader',
+    };
+
+    it('locks request shape, timeout, and idempotency', () => {
+      const contract = getRequestContract('governance.delegate');
+
+      expect(contract).toMatchObject({
+        method: 'governance.delegate',
+        timeoutMs: 120_000,
+        idempotency: 'non_idempotent',
+        mutatesDaemonDb: false,
+        requestShape: expect.any(Object),
+        responseShape: expect.any(Object),
+        validationErrors: expect.any(Array),
+      });
+      expect(contract.requestShape).toMatchObject({
+        agentId: 'UUID string',
+        capability: 'non-empty string',
+        promptKey: 'non-empty string',
+        messages: 'non-empty array of {role,content} entries',
+        source: 'non-empty string',
+      });
+      expect(contract.responseShape).toMatchObject({
+        ok: 'boolean',
+        text: 'string',
+        agentId: 'UUID string',
+        capability: 'non-empty string',
+      });
+      expect(contract.timeoutError).toMatchObject({
+        code: 'IPC_TIMEOUT',
+        timeoutMs: 120_000,
+      });
+    });
+
+    it('accepts a minimal valid request payload', () => {
+      expect(validateRequestPayload('governance.delegate', { ...validBase })).toEqual({
+        ok: true,
+        errors: [],
+      });
+    });
+
+    it('accepts a fully populated request payload', () => {
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        toolContext: { name: 'lookup' },
+        maxTokens: 1024,
+        maxToolRounds: 3,
+        responseFormat: 'decision_word',
+        validDecisions: ['NOTIFY', 'SKIP'],
+        correlationId: 'corr-1',
+      })).toEqual({ ok: true, errors: [] });
+    });
+
+    it('rejects non-UUID agentId', () => {
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        agentId: 'not-a-uuid',
+      })).toEqual({
+        ok: false,
+        errors: ['agentId must be a UUID string'],
+      });
+    });
+
+    it('rejects empty / non-string capability', () => {
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        capability: '',
+      })).toEqual({
+        ok: false,
+        errors: ['capability must be a non-empty string'],
+      });
+
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        capability: 42,
+      })).toEqual({
+        ok: false,
+        errors: ['capability must be a non-empty string'],
+      });
+    });
+
+    it('rejects empty / non-string promptKey and source', () => {
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        promptKey: '',
+      })).toEqual({
+        ok: false,
+        errors: ['promptKey must be a non-empty string'],
+      });
+
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        source: '',
+      })).toEqual({
+        ok: false,
+        errors: ['source must be a non-empty string'],
+      });
+    });
+
+    it('rejects empty / non-array messages', () => {
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        messages: [],
+      })).toEqual({
+        ok: false,
+        errors: ['messages must be a non-empty array of {role,content} entries'],
+      });
+
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        messages: 'not-an-array',
+      })).toEqual({
+        ok: false,
+        errors: ['messages must be a non-empty array of {role,content} entries'],
+      });
+    });
+
+    it('rejects messages entries missing role or content', () => {
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        messages: [{ role: 'user' }],
+      })).toEqual({
+        ok: false,
+        errors: ['messages[0].content must be a non-empty string'],
+      });
+
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        messages: [{ content: 'hi' }],
+      })).toEqual({
+        ok: false,
+        errors: ['messages[0].role must be a non-empty string'],
+      });
+    });
+
+    it('requires validDecisions when responseFormat is decision_word', () => {
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        responseFormat: 'decision_word',
+      })).toEqual({
+        ok: false,
+        errors: ['validDecisions must be a non-empty array of uppercase tokens when responseFormat is decision_word'],
+      });
+
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        responseFormat: 'decision_word',
+        validDecisions: [],
+      })).toEqual({
+        ok: false,
+        errors: ['validDecisions must be a non-empty array of uppercase tokens when responseFormat is decision_word'],
+      });
+
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        responseFormat: 'decision_word',
+        validDecisions: 'NOTIFY,SKIP',
+      })).toEqual({
+        ok: false,
+        errors: ['validDecisions must be a non-empty array of uppercase tokens when responseFormat is decision_word'],
+      });
+
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        responseFormat: 'decision_word',
+        validDecisions: ['notify', 'SKIP'],
+      })).toEqual({
+        ok: false,
+        errors: ['validDecisions entries must be uppercase non-empty tokens'],
+      });
+    });
+
+    it('rejects validDecisions tokens containing whitespace, punctuation, or lowercase letters', () => {
+      const cases = [
+        ['NOTIFY NOW'],
+        ['YES!'],
+        ['Notify'],
+        ['notify'],
+        ['NOTIFY', 'sk!p'],
+        ['1NOTIFY'],
+        ['_NOTIFY'],
+        ['NOTIFY-NOW'],
+      ];
+
+      for (const validDecisions of cases) {
+        expect(validateRequestPayload('governance.delegate', {
+          ...validBase,
+          responseFormat: 'decision_word',
+          validDecisions,
+        })).toEqual({
+          ok: false,
+          errors: ['validDecisions entries must be uppercase non-empty tokens'],
+        });
+      }
+    });
+
+    it('accepts validDecisions tokens that match the uppercase identifier shape', () => {
+      const cases = [
+        ['NOTIFY', 'SKIP'],
+        ['APPROVE_ALL', 'ESCALATE_NOW'],
+        ['A1B', 'NOTIFY_2'],
+      ];
+
+      for (const validDecisions of cases) {
+        expect(validateRequestPayload('governance.delegate', {
+          ...validBase,
+          responseFormat: 'decision_word',
+          validDecisions,
+        })).toEqual({ ok: true, errors: [] });
+      }
+    });
+
+    it('locks the exact requestShape structure', () => {
+      const contract = getRequestContract('governance.delegate');
+
+      expect(contract.requestShape).toStrictEqual({
+        agentId: 'UUID string',
+        capability: 'non-empty string',
+        promptKey: 'non-empty string',
+        messages: 'non-empty array of {role,content} entries',
+        toolContext: 'optional object',
+        maxTokens: 'optional positive integer',
+        maxToolRounds: 'optional positive integer',
+        responseFormat: "optional 'plain_text'|'json_text'|'decision_word'",
+        validDecisions: 'optional non-empty array of uppercase tokens; required when responseFormat === decision_word',
+        correlationId: 'optional non-empty string',
+        source: 'non-empty string',
+      });
+    });
+
+    it('locks the exact responseShape structure', () => {
+      const contract = getRequestContract('governance.delegate');
+
+      expect(contract.responseShape).toStrictEqual({
+        ok: 'boolean',
+        text: 'string',
+        usage: 'optional object',
+        agentId: 'UUID string',
+        capability: 'non-empty string',
+        parsedOk: 'optional boolean',
+      });
+    });
+
+    it('locks the exact validationErrors list', () => {
+      const contract = getRequestContract('governance.delegate');
+
+      expect(contract.validationErrors).toStrictEqual([
+        'payload must be an object',
+        'agentId must be a UUID string',
+        'capability must be a non-empty string',
+        'promptKey must be a non-empty string',
+        'source must be a non-empty string',
+        'messages must be a non-empty array of {role,content} entries',
+        'messages[i].role must be a non-empty string',
+        'messages[i].content must be a non-empty string',
+        'toolContext must be an object when provided',
+        'maxTokens must be a positive integer when provided',
+        'maxToolRounds must be a positive integer when provided',
+        'responseFormat must be one of plain_text, json_text, decision_word when provided',
+        'correlationId must be a non-empty string when provided',
+        'validDecisions must be a non-empty array of uppercase tokens when responseFormat is decision_word',
+        'validDecisions entries must be uppercase non-empty tokens',
+      ]);
+    });
+
+    it('rejects unknown responseFormat values', () => {
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        responseFormat: 'binary',
+      })).toEqual({
+        ok: false,
+        errors: ['responseFormat must be one of plain_text, json_text, decision_word when provided'],
+      });
+    });
+
+    it('rejects malformed optional fields', () => {
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        toolContext: 'not-object',
+      })).toEqual({
+        ok: false,
+        errors: ['toolContext must be an object when provided'],
+      });
+
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        maxTokens: 0,
+      })).toEqual({
+        ok: false,
+        errors: ['maxTokens must be a positive integer when provided'],
+      });
+
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        maxToolRounds: -1,
+      })).toEqual({
+        ok: false,
+        errors: ['maxToolRounds must be a positive integer when provided'],
+      });
+
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        correlationId: '',
+      })).toEqual({
+        ok: false,
+        errors: ['correlationId must be a non-empty string when provided'],
+      });
+    });
+
+    it('validates a valid response payload', () => {
+      expect(validateResponsePayload('governance.delegate', {
+        ok: true,
+        text: 'NOTIFY',
+        agentId: AGENT_ID,
+        capability: 'notification_reader',
+      })).toEqual({ ok: true, errors: [] });
+    });
+
+    it('accepts response payload with parsedOk and usage', () => {
+      expect(validateResponsePayload('governance.delegate', {
+        ok: true,
+        text: '{"actions":[]}',
+        agentId: AGENT_ID,
+        capability: 'governance_loop',
+        parsedOk: true,
+        usage: { input_tokens: 12 },
+      })).toEqual({ ok: true, errors: [] });
+    });
+
+    it('rejects malformed response payloads', () => {
+      expect(validateResponsePayload('governance.delegate', {
+        ok: 'true',
+        text: 'NOTIFY',
+        agentId: AGENT_ID,
+        capability: 'notification_reader',
+      })).toEqual({
+        ok: false,
+        errors: ['ok must be a boolean'],
+      });
+
+      expect(validateResponsePayload('governance.delegate', {
+        ok: true,
+        text: 'NOTIFY',
+        agentId: 'agent-1',
+        capability: 'notification_reader',
+      })).toEqual({
+        ok: false,
+        errors: ['agentId must be a UUID string'],
+      });
     });
   });
 

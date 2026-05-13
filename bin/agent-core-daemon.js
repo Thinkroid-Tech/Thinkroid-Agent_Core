@@ -81,6 +81,7 @@ import { createThinkDeeper } from '../src/lib/daemon-ce-stage-4.js';
 import { createBrainChatHandler } from '../src/lib/brain-chat-handler.js';
 import { resolveAiConfig, setAiConfig } from '../src/lib/resolveAiConfig.js';
 import { registerDaemonIpcHandlers } from '../src/handlers/daemon-ipc-handlers.js';
+import { registerGovernanceDelegateHandler } from '../src/handlers/governance-delegate-handler.js';
 import {
   setAthenaMode,
   getAthenaModeAllowlist,
@@ -654,6 +655,16 @@ async function main() {
     ipcAdapter,
     toolRegistry,
     brainConfig: config.brainConfig ?? null,
+  });
+
+  // Phase 16γ.B.4a Commit #1 — register the `governance.delegate` IPC
+  // handler. The stub returned at this point validates the locked
+  // contract surface and rejects every request with a not-ready error
+  // until Commit #2 wires real per-agent Brain execution. Registered
+  // here so the handler is in place before `daemon:ready` is emitted.
+  registerGovernanceDelegateHandler(kernel, {
+    agentId,
+    agentName: config.agentName ?? null,
   });
 
   // S6b — Full SIGTERM handler (M51). Replaces the S6a early stub.

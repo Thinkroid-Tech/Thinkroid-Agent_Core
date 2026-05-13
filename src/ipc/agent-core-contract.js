@@ -170,6 +170,51 @@ const REQUEST_CONTRACTS = Object.freeze({
       'options must be an object when provided',
     ],
   }),
+  'governance.delegate': makeRequestContract({
+    method: 'governance.delegate',
+    timeoutMs: 120_000,
+    idempotency: 'non_idempotent',
+    mutatesDaemonDb: false,
+    scheduler: DEFAULT_SCHEDULER,
+    requestShape: {
+      agentId: 'UUID string',
+      capability: 'non-empty string',
+      promptKey: 'non-empty string',
+      messages: 'non-empty array of {role,content} entries',
+      toolContext: 'optional object',
+      maxTokens: 'optional positive integer',
+      maxToolRounds: 'optional positive integer',
+      responseFormat: "optional 'plain_text'|'json_text'|'decision_word'",
+      validDecisions: 'optional non-empty array of uppercase tokens; required when responseFormat === decision_word',
+      correlationId: 'optional non-empty string',
+      source: 'non-empty string',
+    },
+    responseShape: {
+      ok: 'boolean',
+      text: 'string',
+      usage: 'optional object',
+      agentId: 'UUID string',
+      capability: 'non-empty string',
+      parsedOk: 'optional boolean',
+    },
+    validationErrors: [
+      'payload must be an object',
+      'agentId must be a UUID string',
+      'capability must be a non-empty string',
+      'promptKey must be a non-empty string',
+      'source must be a non-empty string',
+      'messages must be a non-empty array of {role,content} entries',
+      'messages[i].role must be a non-empty string',
+      'messages[i].content must be a non-empty string',
+      'toolContext must be an object when provided',
+      'maxTokens must be a positive integer when provided',
+      'maxToolRounds must be a positive integer when provided',
+      'responseFormat must be one of plain_text, json_text, decision_word when provided',
+      'correlationId must be a non-empty string when provided',
+      'validDecisions must be a non-empty array of uppercase tokens when responseFormat is decision_word',
+      'validDecisions entries must be uppercase non-empty tokens',
+    ],
+  }),
 });
 
 const NOTIFICATION_CONTRACTS = Object.freeze({
@@ -271,6 +316,20 @@ export function validateRequestPayload(method, payload) {
         ...validateEventPayload(payload.event),
         ...optionalPlainObject(payload.options, 'options'),
       ]);
+    case 'governance.delegate':
+      return validationResult([
+        ...requireUuidString(payload.agentId, 'agentId'),
+        ...requireNonEmptyString(payload.capability, 'capability'),
+        ...requireNonEmptyString(payload.promptKey, 'promptKey'),
+        ...requireNonEmptyString(payload.source, 'source'),
+        ...validateGovernanceMessages(payload.messages),
+        ...optionalPlainObject(payload.toolContext, 'toolContext'),
+        ...optionalPositiveInteger(payload.maxTokens, 'maxTokens'),
+        ...optionalPositiveInteger(payload.maxToolRounds, 'maxToolRounds'),
+        ...optionalResponseFormat(payload.responseFormat),
+        ...optionalNonEmptyString(payload.correlationId, 'correlationId'),
+        ...validateGovernanceValidDecisions(payload.responseFormat, payload.validDecisions),
+      ]);
     default:
       return invalid(`unknown request method: ${method}`);
   }
@@ -310,6 +369,15 @@ export function validateResponsePayload(method, payload) {
       return validationResult([
         ...requireBoolean(payload.ok, 'ok'),
         ...requireBoolean(payload.accepted, 'accepted'),
+      ]);
+    case 'governance.delegate':
+      return validationResult([
+        ...requireBoolean(payload.ok, 'ok'),
+        ...requireString(payload.text, 'text'),
+        ...optionalPlainObject(payload.usage, 'usage'),
+        ...requireUuidString(payload.agentId, 'agentId'),
+        ...requireNonEmptyString(payload.capability, 'capability'),
+        ...optionalBoolean(payload.parsedOk, 'parsedOk'),
       ]);
     default:
       return invalid(`unknown request method: ${method}`);
@@ -475,3 +543,69 @@ function requireOneOf(value, field, allowed) {
     ? []
     : [`${field} must be one of ${allowed.join(', ')}`];
 }
+
+function requireString(value, field) {
+  return typeof value === 'string' ? [] : [`${field} must be a string`];
+}
+
+const GOVERNANCE_RESPONSE_FORMATS = ['plain_text', 'json_text', 'decision_word'];
+
+function optionalResponseFormat(value) {
+  if (value === undefined) return [];
+  if (typeof value === 'string' && GOVERNANCE_RESPONSE_FORMATS.includes(value)) {
+    return [];
+  }
+  return [`responseFormat must be one of ${GOVERNANCE_RESPONSE_FORMATS.join(', ')} when provided`];
+}
+
+function validateGovernanceMessages(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return ['messages must be a non-empty array of {role,content} entries'];
+  }
+  const errors = [];
+  for (let i = 0; i < messages.length; i += 1) {
+    const entry = messages[i];
+    if (!isPlainObject(entry)) {
+      errors.push(`messages[${i}] must be an object`);
+      continue;
+    }
+    if (typeof entry.role !== 'string' || entry.role.length === 0) {
+      errors.push(`messages[${i}].role must be a non-empty string`);
+    }
+    if (typeof entry.content !== 'string' || entry.content.length === 0) {
+      errors.push(`messages[${i}].content must be a non-empty string`);
+    }
+  }
+  return errors;
+}
+
+function validateGovernanceValidDecisions(responseFormat, validDecisions) {
+  const isDecisionWord = responseFormat === 'decision_word';
+
+  if (validDecisions === undefined) {
+    return isDecisionWord
+      ? ['validDecisions must be a non-empty array of uppercase tokens when responseFormat is decision_word']
+      : [];
+  }
+
+  if (!Array.isArray(validDecisions) || validDecisions.length === 0) {
+    return isDecisionWord
+      ? ['validDecisions must be a non-empty array of uppercase tokens when responseFormat is decision_word']
+      : ['validDecisions must be a non-empty array of uppercase tokens when provided'];
+  }
+
+  for (const token of validDecisions) {
+    if (typeof token !== 'string' || !VALID_DECISION_TOKEN_PATTERN.test(token)) {
+      return ['validDecisions entries must be uppercase non-empty tokens'];
+    }
+  }
+
+  return [];
+}
+
+// Uppercase identifier-style tokens: must start with an ASCII letter A-Z,
+// followed by zero or more A-Z / 0-9 / underscore characters. This rejects
+// whitespace, punctuation, lowercase letters, leading digits, and leading
+// underscores — keeping decision words safe to interpolate into prompts and
+// downstream consumers.
+const VALID_DECISION_TOKEN_PATTERN = /^[A-Z][A-Z0-9_]*$/;
