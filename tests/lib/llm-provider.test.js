@@ -183,7 +183,7 @@ describe('llm-provider primitives', () => {
     );
   });
 
-  it('streamChatCompletion rejects tool-call chunks with a structured B2 error code', async () => {
+  it('streamChatCompletion rejects tool-call chunks when no onToolCall callback is provided', async () => {
     const { streamChatCompletion } = await import('../../src/lib/llm-provider/streaming-chat.js');
     const clientFactory = vi.fn(() => ({
       chat: {
@@ -206,11 +206,11 @@ describe('llm-provider primitives', () => {
       clientFactory,
       retry: (fn) => fn(),
     }))).rejects.toMatchObject({
-      code: 'daemon_tool_calls_not_supported_in_b2',
+      code: 'daemon_tool_calls_require_callback',
     });
   });
 
-  it('streamChatCompletion rejects legacy function_call finish reasons', async () => {
+  it('streamChatCompletion rejects legacy function_call finish reasons when no onToolCall callback is provided', async () => {
     const { streamChatCompletion } = await import('../../src/lib/llm-provider/streaming-chat.js');
     const clientFactory = vi.fn(() => ({
       chat: {
@@ -232,7 +232,213 @@ describe('llm-provider primitives', () => {
       clientFactory,
       retry: (fn) => fn(),
     }))).rejects.toMatchObject({
-      code: 'daemon_tool_calls_not_supported_in_b2',
+      code: 'daemon_tool_calls_require_callback',
+    });
+  });
+
+  it('streamChatCompletion invokes onToolCall with a complete tool call assembled across deltas', async () => {
+    const { streamChatCompletion } = await import('../../src/lib/llm-provider/streaming-chat.js');
+    const onToolCall = vi.fn(async () => {});
+    const clientFactory = vi.fn(() => ({
+      chat: {
+        completions: {
+          create: vi.fn(async () => providerStream([
+            { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"q":' } }] } }] },
+            { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '"foo"}' } }] } }] },
+            { choices: [{ finish_reason: 'tool_calls', delta: {} }] },
+          ])),
+        },
+      },
+    }));
+
+    const chunks = await collectStream(streamChatCompletion({
+      config: {
+        baseUrl: 'http://provider.test/v1',
+        apiKey: 'sk-test',
+        model: 'gpt-test',
+      },
+      messages: [{ role: 'user', content: 'use a tool' }],
+      tools: [{ type: 'function', function: { name: 'lookup' } }],
+      clientFactory,
+      retry: (fn) => fn(),
+      onToolCall,
+    }));
+
+    expect(chunks).toEqual([]);
+    expect(onToolCall).toHaveBeenCalledTimes(1);
+    expect(onToolCall).toHaveBeenCalledWith({
+      type: 'tool_call',
+      toolCallId: 'call-1',
+      name: 'lookup',
+      args: { q: 'foo' },
+      finishReason: 'tool_calls',
+    });
+  });
+
+  it('streamChatCompletion emits multiple parallel tool calls in index order', async () => {
+    const { streamChatCompletion } = await import('../../src/lib/llm-provider/streaming-chat.js');
+    const onToolCall = vi.fn(async () => {});
+    const clientFactory = vi.fn(() => ({
+      chat: {
+        completions: {
+          create: vi.fn(async () => providerStream([
+            { choices: [{ delta: { tool_calls: [
+              { index: 1, id: 'call-b', type: 'function', function: { name: 'bravo', arguments: '{"b":2}' } },
+              { index: 0, id: 'call-a', type: 'function', function: { name: 'alpha', arguments: '{"a":1}' } },
+            ] } }] },
+            { choices: [{ finish_reason: 'tool_calls', delta: {} }] },
+          ])),
+        },
+      },
+    }));
+
+    await collectStream(streamChatCompletion({
+      config: { baseUrl: 'http://provider.test/v1', apiKey: 'sk-test', model: 'gpt-test' },
+      messages: [{ role: 'user', content: 'use tools' }],
+      clientFactory,
+      retry: (fn) => fn(),
+      onToolCall,
+    }));
+
+    expect(onToolCall).toHaveBeenCalledTimes(2);
+    expect(onToolCall.mock.calls[0][0]).toMatchObject({
+      toolCallId: 'call-a',
+      name: 'alpha',
+      args: { a: 1 },
+    });
+    expect(onToolCall.mock.calls[1][0]).toMatchObject({
+      toolCallId: 'call-b',
+      name: 'bravo',
+      args: { b: 2 },
+    });
+  });
+
+  it('streamChatCompletion preserves text yields when tool calls are present', async () => {
+    const { streamChatCompletion } = await import('../../src/lib/llm-provider/streaming-chat.js');
+    const onToolCall = vi.fn(async () => {});
+    const clientFactory = vi.fn(() => ({
+      chat: {
+        completions: {
+          create: vi.fn(async () => providerStream([
+            { choices: [{ delta: { content: 'thinking…' } }] },
+            { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"q":"foo"}' } }] } }] },
+            { choices: [{ finish_reason: 'tool_calls', delta: {} }] },
+          ])),
+        },
+      },
+    }));
+
+    const chunks = await collectStream(streamChatCompletion({
+      config: { baseUrl: 'http://provider.test/v1', apiKey: 'sk-test', model: 'gpt-test' },
+      messages: [{ role: 'user', content: 'use a tool' }],
+      clientFactory,
+      retry: (fn) => fn(),
+      onToolCall,
+    }));
+
+    expect(chunks).toEqual(['thinking…']);
+    expect(onToolCall).toHaveBeenCalledTimes(1);
+    expect(onToolCall).toHaveBeenCalledWith({
+      type: 'tool_call',
+      toolCallId: 'call-1',
+      name: 'lookup',
+      args: { q: 'foo' },
+      finishReason: 'tool_calls',
+    });
+  });
+
+  it('streamChatCompletion forwards raw arguments string when JSON.parse fails', async () => {
+    const { streamChatCompletion } = await import('../../src/lib/llm-provider/streaming-chat.js');
+    const onToolCall = vi.fn(async () => {});
+    const clientFactory = vi.fn(() => ({
+      chat: {
+        completions: {
+          create: vi.fn(async () => providerStream([
+            { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{not json' } }] } }] },
+            { choices: [{ finish_reason: 'tool_calls', delta: {} }] },
+          ])),
+        },
+      },
+    }));
+
+    await collectStream(streamChatCompletion({
+      config: { baseUrl: 'http://provider.test/v1', apiKey: 'sk-test', model: 'gpt-test' },
+      messages: [{ role: 'user', content: 'use a tool' }],
+      clientFactory,
+      retry: (fn) => fn(),
+      onToolCall,
+    }));
+
+    expect(onToolCall).toHaveBeenCalledTimes(1);
+    expect(onToolCall).toHaveBeenCalledWith({
+      type: 'tool_call',
+      toolCallId: 'call-1',
+      name: 'lookup',
+      args: '{not json',
+      finishReason: 'tool_calls',
+    });
+  });
+
+  it('streamChatCompletion maps legacy function_call delta onto index 0 with toolCallId null', async () => {
+    const { streamChatCompletion } = await import('../../src/lib/llm-provider/streaming-chat.js');
+    const onToolCall = vi.fn(async () => {});
+    const clientFactory = vi.fn(() => ({
+      chat: {
+        completions: {
+          create: vi.fn(async () => providerStream([
+            { choices: [{ delta: { function_call: { name: 'legacy_tool', arguments: '{"x":1}' } } }] },
+            { choices: [{ finish_reason: 'function_call', delta: {} }] },
+          ])),
+        },
+      },
+    }));
+
+    await collectStream(streamChatCompletion({
+      config: { baseUrl: 'http://provider.test/v1', apiKey: 'sk-test', model: 'gpt-test' },
+      messages: [{ role: 'user', content: 'use a legacy tool' }],
+      clientFactory,
+      retry: (fn) => fn(),
+      onToolCall,
+    }));
+
+    expect(onToolCall).toHaveBeenCalledTimes(1);
+    expect(onToolCall).toHaveBeenCalledWith({
+      type: 'tool_call',
+      toolCallId: null,
+      name: 'legacy_tool',
+      args: { x: 1 },
+      finishReason: 'function_call',
+    });
+  });
+
+  it('streamChatCompletion flushes accumulated tool-call state at stream end even without an explicit finish_reason', async () => {
+    const { streamChatCompletion } = await import('../../src/lib/llm-provider/streaming-chat.js');
+    const onToolCall = vi.fn(async () => {});
+    const clientFactory = vi.fn(() => ({
+      chat: {
+        completions: {
+          create: vi.fn(async () => providerStream([
+            { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"q":"foo"}' } }] } }] },
+          ])),
+        },
+      },
+    }));
+
+    await collectStream(streamChatCompletion({
+      config: { baseUrl: 'http://provider.test/v1', apiKey: 'sk-test', model: 'gpt-test' },
+      messages: [{ role: 'user', content: 'use a tool' }],
+      clientFactory,
+      retry: (fn) => fn(),
+      onToolCall,
+    }));
+
+    expect(onToolCall).toHaveBeenCalledTimes(1);
+    expect(onToolCall).toHaveBeenCalledWith({
+      type: 'tool_call',
+      toolCallId: 'call-1',
+      name: 'lookup',
+      args: { q: 'foo' },
+      finishReason: null,
     });
   });
 

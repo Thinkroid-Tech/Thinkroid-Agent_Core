@@ -225,8 +225,8 @@ describe('brain-chat handler', () => {
   });
 
   it('propagates provider tool-call rejection without catching it', async () => {
-    const err = new Error('daemon_tool_calls_not_supported_in_b2');
-    err.code = 'daemon_tool_calls_not_supported_in_b2';
+    const err = new Error('daemon streaming tool calls require an onToolCall callback');
+    err.code = 'daemon_tool_calls_require_callback';
     const streamChatCompletion = vi.fn(() => throwingProviderStream(err));
     const handler = createBrainChatHandler({
       agentId: 'agent-1',

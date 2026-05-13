@@ -179,10 +179,11 @@ export function createDaemonTextChat({
     max_tokens: maxTokensSnake,
     // `tools` is accepted on the params object so callers can declare
     // intent (e.g. governance.delegate's tool-text path), but the daemon
-    // text shim deliberately does NOT forward it to the provider yet —
-    // the underlying streamChatCompletion still rejects tool-call signals
-    // (see createUnsupportedToolCallError). Tool-loop wiring lands in a
-    // later sub-phase; for now `tools` is captured for observability only.
+    // text shim deliberately does NOT forward it to the provider yet.
+    // streamChatCompletion supports tool calls only when callers opt in
+    // via an `onToolCall` callback; this text shim does not pass one, so
+    // any tool-call signal still surfaces as createUnsupportedToolCallError.
+    // For now `tools` is captured for observability only.
     // eslint-disable-next-line no-unused-vars
     tools,
     configOverride,
