@@ -28,6 +28,7 @@ describe('agent-core IPC contract', () => {
       'session.receiveEvent',
       'brain.toolLoop',
       'brain.toolLoop.resume',
+      'brain.chatToolStream',
       'governance.delegate',
     ]);
 

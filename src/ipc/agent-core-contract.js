@@ -258,6 +258,62 @@ const REQUEST_CONTRACTS = Object.freeze({
       'correlationId must be a non-empty string when provided',
     ],
   }),
+  'brain.chatToolStream': makeRequestContract({
+    method: 'brain.chatToolStream',
+    timeoutMs: 300_000,
+    idempotency: 'non_idempotent',
+    // The handler may persist an approval-pending suspension row mid-stream,
+    // identical to the non-streaming brain.toolLoop path.
+    mutatesDaemonDb: true,
+    scheduler: DEFAULT_SCHEDULER,
+    requestShape: {
+      agentId: 'UUID string',
+      messages: 'non-empty array of {role,content} entries',
+      tools: 'optional array of tool definitions with {name, description?, parameters?, executor: "local"|"remote"}',
+      toolContext: 'optional object — opaque, forwarded to remote tools',
+      maxTokens: 'optional positive integer',
+      maxToolRounds: 'optional positive integer; default 25, hard-cap 50',
+      taskId: 'optional non-empty string',
+      skipInterruptCheck: 'optional boolean',
+      stream: 'must be true',
+      configOverride: 'optional object',
+      backupConfigOverride:
+        'optional object — fallback config when primary configOverride resolution is unavailable (special-role agent chat dual-path)',
+      correlationId: 'optional non-empty string',
+      source: 'non-empty string',
+    },
+    responseShape: {
+      ok: 'boolean',
+      text: 'string',
+      agentId: 'UUID string',
+      status: '"completed" | "approval_pending" | "interrupted" | "failed"',
+      usage: 'optional object',
+      suspensionId: 'optional string — set when status==="approval_pending"',
+      toolCallId: 'optional string — set when status==="approval_pending"',
+      conversationMessages: 'optional array — full message history including tool calls/results, for caller persistence',
+    },
+    validationErrors: [
+      'payload must be an object',
+      'agentId must be a UUID string',
+      'source must be a non-empty string',
+      'messages must be a non-empty array of {role,content} entries',
+      'messages[i].role must be a non-empty string',
+      'messages[i].content must be a non-empty string',
+      'tools must be an array when provided',
+      'tools[i] must have a non-empty string name',
+      'tools[i].executor must be "local" or "remote"',
+      'toolContext must be an object when provided',
+      'maxTokens must be a positive integer when provided',
+      'maxToolRounds must be a positive integer when provided',
+      'maxToolRounds must not exceed 50',
+      'taskId must be a non-empty string when provided',
+      'skipInterruptCheck must be a boolean when provided',
+      'stream must be true',
+      'configOverride must be an object when provided',
+      'backupConfigOverride must be an object when provided',
+      'correlationId must be a non-empty string when provided',
+    ],
+  }),
   'governance.delegate': makeRequestContract({
     method: 'governance.delegate',
     timeoutMs: 120_000,
@@ -432,6 +488,22 @@ export function validateRequestPayload(method, payload) {
         ...optionalPlainObject(payload.configOverride, 'configOverride'),
         ...optionalNonEmptyString(payload.correlationId, 'correlationId'),
       ]);
+    case 'brain.chatToolStream':
+      return validationResult([
+        ...requireUuidString(payload.agentId, 'agentId'),
+        ...requireNonEmptyString(payload.source, 'source'),
+        ...validateGovernanceMessages(payload.messages),
+        ...validateBrainToolLoopTools(payload.tools),
+        ...optionalPlainObject(payload.toolContext, 'toolContext'),
+        ...optionalPositiveInteger(payload.maxTokens, 'maxTokens'),
+        ...validateMaxToolRounds(payload.maxToolRounds),
+        ...optionalNonEmptyString(payload.taskId, 'taskId'),
+        ...optionalBoolean(payload.skipInterruptCheck, 'skipInterruptCheck'),
+        ...requireStreamTrue(payload.stream),
+        ...optionalPlainObject(payload.configOverride, 'configOverride'),
+        ...optionalPlainObject(payload.backupConfigOverride, 'backupConfigOverride'),
+        ...optionalNonEmptyString(payload.correlationId, 'correlationId'),
+      ]);
     case 'brain.toolLoop.resume':
       return validationResult([
         ...requireUuidString(payload.agentId, 'agentId'),
@@ -492,6 +564,7 @@ export function validateResponsePayload(method, payload) {
       ]);
     case 'brain.toolLoop':
     case 'brain.toolLoop.resume':
+    case 'brain.chatToolStream':
       return validationResult([
         ...requireBoolean(payload.ok, 'ok'),
         ...requireString(payload.text, 'text'),
@@ -776,6 +849,10 @@ function validateMaxToolRounds(value) {
     return ['maxToolRounds must not exceed 50'];
   }
   return [];
+}
+
+function requireStreamTrue(value) {
+  return value === true ? [] : ['stream must be true'];
 }
 
 function validateBrainToolLoopStatus(value) {

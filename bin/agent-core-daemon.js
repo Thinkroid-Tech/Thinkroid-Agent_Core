@@ -84,6 +84,7 @@ import { registerDaemonIpcHandlers } from '../src/handlers/daemon-ipc-handlers.j
 import { registerGovernanceDelegateHandler } from '../src/handlers/governance-delegate-handler.js';
 import { registerBrainToolLoopHandler } from '../src/handlers/brain-tool-loop-handler.js';
 import { registerBrainToolLoopResumeHandler } from '../src/handlers/brain-tool-loop-resume-handler.js';
+import { registerBrainChatToolStreamHandler } from '../src/handlers/brain-chat-tool-stream-handler.js';
 import {
   setAthenaMode,
   getAthenaModeAllowlist,
@@ -693,6 +694,20 @@ async function main() {
   // suspensions table backed by agent-core.db so a daemon restart
   // between suspend and resume sees the same durable state.
   registerBrainToolLoopResumeHandler(kernel, {
+    agentId,
+    brainConfig: config.brainConfig ?? null,
+    aiConfigResolver: resolveAiConfig,
+    sendNotification,
+    ipcAdapter,
+    agentCoreDb,
+  });
+
+  // Streaming tool-loop. Same routing semantics as brain.toolLoop, but
+  // provider text deltas surface to the caller as `text_chunk` partials
+  // and tool dispatch surfaces as `tool_use` / `tool_result` partials.
+  // Approval-pending dispatches persist a suspension row identical to
+  // the non-streaming path and emit an `approval_required` partial.
+  registerBrainChatToolStreamHandler(kernel, {
     agentId,
     brainConfig: config.brainConfig ?? null,
     aiConfigResolver: resolveAiConfig,
