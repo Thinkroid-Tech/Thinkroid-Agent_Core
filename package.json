@@ -4,6 +4,16 @@
   "type": "module",
   "private": true,
   "description": "Per-agent daemon for the Thinkroid-Space platform (Brain + Context Engine + Cerebellum + per-agent SQLite).",
+  "license": "Apache-2.0",
+  "author": "Thinkroid Technologies Inc.",
+  "homepage": "https://github.com/Thinkroid-Tech/Thinkroid-Agent_Core#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Thinkroid-Tech/Thinkroid-Agent_Core.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Thinkroid-Tech/Thinkroid-Agent_Core/issues"
+  },
   "main": "src/kernel.js",
   "bin": {
     "agent-core-daemon": "bin/agent-core-daemon.js"

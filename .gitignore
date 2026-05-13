@@ -10,3 +10,6 @@ coverage/
 .env
 .env.*
 !.env.example
+
+# AI tooling local state — never commit
+.claude/
