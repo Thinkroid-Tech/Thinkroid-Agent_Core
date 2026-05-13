@@ -131,6 +131,12 @@ export function createGovernanceDelegateHandler({ agentId, textChat, sendNotific
         toolContext: hasToolContext ? params.toolContext : undefined,
         maxToolRounds: hasToolContext ? (params.maxToolRounds ?? 1) : undefined,
         onUsage,
+        // Forward the per-call provider/model override into the daemon
+        // text shim. Special-role agents (Athena summary, etc.) carry their
+        // own provider config that the daemon's per-agent cache may not know
+        // about; `createDaemonTextChat(...)` already prefers `configOverride`
+        // over the cached brain config when it is supplied.
+        configOverride: params.configOverride,
       });
     } catch (err) {
       rejectApplication(`provider error: ${err?.message ?? err}`, {

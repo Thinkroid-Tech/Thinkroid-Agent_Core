@@ -282,6 +282,41 @@ describe('governance.delegate handler — decision_word path', () => {
   });
 });
 
+describe('governance.delegate handler — configOverride forwarding', () => {
+  it('forwards configOverride verbatim to the daemon textChat shim', async () => {
+    const textChat = makeTextChatStub('hello');
+    const kernel = makeKernel({ textChat });
+    const configOverride = {
+      model: 'gpt-4o',
+      baseUrl: 'https://x',
+      apiKey: 'sk-x',
+    };
+
+    const result = await kernel.dispatch(
+      'governance.delegate',
+      validPayload({ configOverride }),
+    );
+
+    expect(result.ok).toBe(true);
+    expect(textChat.calls).toHaveLength(1);
+    // The handler must thread the caller-supplied configOverride straight
+    // through to textChat — `createDaemonTextChat(...)` consumes it via
+    // the daemon-ipc-handlers code path, applying it for this call only
+    // without mutating any per-agent cached brain config.
+    expect(textChat.calls[0].configOverride).toEqual(configOverride);
+  });
+
+  it('omits configOverride when caller did not supply one', async () => {
+    const textChat = makeTextChatStub('hello');
+    const kernel = makeKernel({ textChat });
+
+    await kernel.dispatch('governance.delegate', validPayload());
+
+    expect(textChat.calls).toHaveLength(1);
+    expect(textChat.calls[0].configOverride).toBeUndefined();
+  });
+});
+
 describe('governance.delegate handler — provider error mapping', () => {
   it('wraps upstream textChat throws as PROVIDER_ERROR (retryable)', async () => {
     const textChat = makeTextChatStub(() => {

@@ -450,6 +450,8 @@ describe('agent-core IPC contract', () => {
         maxToolRounds: 'optional positive integer',
         responseFormat: "optional 'plain_text'|'json_text'|'decision_word'",
         validDecisions: 'optional non-empty array of uppercase tokens; required when responseFormat === decision_word',
+        configOverride:
+          'optional object — per-call provider/model override; daemon applies for this call only without mutating per-agent cached config',
         correlationId: 'optional non-empty string',
         source: 'non-empty string',
       });
@@ -484,10 +486,36 @@ describe('agent-core IPC contract', () => {
         'maxTokens must be a positive integer when provided',
         'maxToolRounds must be a positive integer when provided',
         'responseFormat must be one of plain_text, json_text, decision_word when provided',
+        'configOverride must be an object when provided',
         'correlationId must be a non-empty string when provided',
         'validDecisions must be a non-empty array of uppercase tokens when responseFormat is decision_word',
         'validDecisions entries must be uppercase non-empty tokens',
       ]);
+    });
+
+    it('accepts a configOverride object as an optional field', () => {
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        configOverride: { model: 'gpt-4o', baseUrl: 'https://x', apiKey: 'sk-x' },
+      })).toEqual({ ok: true, errors: [] });
+    });
+
+    it('rejects a non-object configOverride', () => {
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        configOverride: 'not-object',
+      })).toEqual({
+        ok: false,
+        errors: ['configOverride must be an object when provided'],
+      });
+
+      expect(validateRequestPayload('governance.delegate', {
+        ...validBase,
+        configOverride: ['arr'],
+      })).toEqual({
+        ok: false,
+        errors: ['configOverride must be an object when provided'],
+      });
     });
 
     it('rejects unknown responseFormat values', () => {
