@@ -88,3 +88,34 @@ CREATE TABLE IF NOT EXISTS token_usage (
 CREATE INDEX IF NOT EXISTS idx_history_session ON session_history(session_id, turn_index);
 CREATE INDEX IF NOT EXISTS idx_meta_status ON session_meta(status);
 CREATE INDEX IF NOT EXISTS idx_token_usage_created_at ON token_usage(created_at);
+
+-- Durable suspension records for the daemon-side multi-round tool loop.
+-- When a remote tool dispatch returns an approval-pending envelope, the
+-- handler snapshots the in-progress conversation here and returns
+-- status='approval_pending' to the caller. A follow-up resume request
+-- (with the matching approvalId) replays the loop from this row and
+-- caches the final response so subsequent retries are idempotent.
+CREATE TABLE IF NOT EXISTS tool_loop_suspensions (
+  id                          TEXT PRIMARY KEY,
+  agent_id                    TEXT NOT NULL,
+  task_id                     TEXT,
+  session_id                  TEXT,
+  status                      TEXT NOT NULL DEFAULT 'pending',
+  tool_call_id                TEXT NOT NULL,
+  tool_name                   TEXT NOT NULL,
+  tool_args_json              TEXT,
+  tool_context_json           TEXT,
+  conversation_messages_json  TEXT NOT NULL,
+  max_tokens                  INTEGER,
+  max_tool_rounds_remaining   INTEGER NOT NULL,
+  approval_id                 TEXT,
+  idempotency_key             TEXT,
+  config_override_json        TEXT,
+  final_response_json         TEXT,
+  created_at                  TEXT NOT NULL,
+  updated_at                  TEXT NOT NULL,
+  resumed_at                  TEXT,
+  CHECK (status IN ('pending','resumed','cancelled','expired'))
+);
+CREATE INDEX IF NOT EXISTS idx_tool_loop_suspensions_status ON tool_loop_suspensions (status);
+CREATE INDEX IF NOT EXISTS idx_tool_loop_suspensions_agent ON tool_loop_suspensions (agent_id, status);

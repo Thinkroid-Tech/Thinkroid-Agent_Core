@@ -221,6 +221,43 @@ const REQUEST_CONTRACTS = Object.freeze({
       'correlationId must be a non-empty string when provided',
     ],
   }),
+  'brain.toolLoop.resume': makeRequestContract({
+    method: 'brain.toolLoop.resume',
+    timeoutMs: 300_000,
+    idempotency: 'idempotent_per_suspensionId_approvalId',
+    mutatesDaemonDb: true,
+    scheduler: DEFAULT_SCHEDULER,
+    requestShape: {
+      agentId: 'UUID string',
+      suspensionId: 'non-empty string',
+      approvalId: 'non-empty string',
+      toolResult: 'object with at least content: string OR isToolError: true',
+      decidedBy: 'optional non-empty string',
+      correlationId: 'optional non-empty string',
+    },
+    responseShape: {
+      ok: 'boolean',
+      text: 'string',
+      agentId: 'UUID string',
+      status: '"completed" | "approval_pending" | "interrupted" | "failed"',
+      usage: 'optional object',
+      suspensionId: 'optional string',
+      toolCallId: 'optional string',
+      conversationMessages: 'optional array',
+    },
+    validationErrors: [
+      'payload must be an object',
+      'agentId must be a UUID string',
+      'suspensionId must be a non-empty string',
+      'approvalId must be a non-empty string',
+      'toolResult must be an object',
+      'toolResult.content must be a string when provided',
+      'toolResult.isToolError must be a boolean when provided',
+      'toolResult must include content (string) or isToolError: true',
+      'decidedBy must be a non-empty string when provided',
+      'correlationId must be a non-empty string when provided',
+    ],
+  }),
   'governance.delegate': makeRequestContract({
     method: 'governance.delegate',
     timeoutMs: 120_000,
@@ -395,6 +432,15 @@ export function validateRequestPayload(method, payload) {
         ...optionalPlainObject(payload.configOverride, 'configOverride'),
         ...optionalNonEmptyString(payload.correlationId, 'correlationId'),
       ]);
+    case 'brain.toolLoop.resume':
+      return validationResult([
+        ...requireUuidString(payload.agentId, 'agentId'),
+        ...requireNonEmptyString(payload.suspensionId, 'suspensionId'),
+        ...requireNonEmptyString(payload.approvalId, 'approvalId'),
+        ...validateToolResult(payload.toolResult),
+        ...optionalNonEmptyString(payload.decidedBy, 'decidedBy'),
+        ...optionalNonEmptyString(payload.correlationId, 'correlationId'),
+      ]);
     default:
       return invalid(`unknown request method: ${method}`);
   }
@@ -445,6 +491,7 @@ export function validateResponsePayload(method, payload) {
         ...optionalBoolean(payload.parsedOk, 'parsedOk'),
       ]);
     case 'brain.toolLoop':
+    case 'brain.toolLoop.resume':
       return validationResult([
         ...requireBoolean(payload.ok, 'ok'),
         ...requireString(payload.text, 'text'),
@@ -735,4 +782,29 @@ function validateBrainToolLoopStatus(value) {
   return typeof value === 'string' && BRAIN_TOOL_LOOP_STATUSES.includes(value)
     ? []
     : [`status must be one of ${BRAIN_TOOL_LOOP_STATUSES.join(', ')}`];
+}
+
+function validateToolResult(value) {
+  if (!isPlainObject(value)) {
+    return ['toolResult must be an object'];
+  }
+  const errors = [];
+  if (value.content !== undefined && typeof value.content !== 'string') {
+    errors.push('toolResult.content must be a string when provided');
+  }
+  if (value.isToolError !== undefined && typeof value.isToolError !== 'boolean') {
+    errors.push('toolResult.isToolError must be a boolean when provided');
+  }
+  // The caller must supply at least one of `content` (the tool's return
+  // text) or `isToolError: true` (an explicit tool-error signal with no
+  // text payload). An empty object would resume the loop with no signal
+  // for the LLM, which is almost certainly a caller bug.
+  const hasContent = typeof value.content === 'string';
+  const hasToolError = value.isToolError === true;
+  if (!hasContent && !hasToolError) {
+    errors.push(
+      'toolResult must include content (string) or isToolError: true',
+    );
+  }
+  return errors;
 }

@@ -416,8 +416,153 @@ describe('brain.toolLoop handler — kernel throw wrapping', () => {
   });
 });
 
-describe('brain.toolLoop handler — APPROVAL_PENDING surfaces NOT_READY', () => {
-  it('throws BRAIN_TOOL_LOOP_APPROVAL_NOT_READY when remote returns approval-pending', async () => {
+describe('brain.toolLoop handler — APPROVAL_PENDING persists durable suspension', () => {
+  function makeStubSuspensionsStore() {
+    return {
+      insertPending: vi.fn(),
+      getById: vi.fn(),
+      markResumed: vi.fn(),
+      markCancelled: vi.fn(),
+      markExpired: vi.fn(),
+    };
+  }
+
+  it('persists a suspension row and returns approval_pending envelope', async () => {
+    const factory = makeClientFactory([
+      makeResponse({
+        message: makeAssistantMessage({
+          tool_calls: [makeToolCall({ id: 'c1', name: 'risky', args: { ammo: 'live' } })],
+        }),
+      }),
+    ]);
+    const suspensionsStore = makeStubSuspensionsStore();
+    const deps = makeBaseDeps({
+      clientFactory: factory,
+      dispatchRemoteTool: vi.fn(async () => ({
+        ok: false,
+        code: 'APPROVAL_PENDING',
+        approvalId: 'a1',
+        name: 'risky',
+        args: { ammo: 'live' },
+      })),
+      suspensionsStore,
+    });
+    const handler = createBrainToolLoopHandler(deps);
+    const result = await handler(validPayload({
+      tools: [{ name: 'risky', executor: 'remote' }],
+    }), {});
+
+    expect(result).toMatchObject({
+      ok: true,
+      status: 'approval_pending',
+      agentId: AGENT_ID,
+      toolCallId: 'c1',
+    });
+    expect(typeof result.suspensionId).toBe('string');
+    expect(result.suspensionId.length).toBeGreaterThan(0);
+    expect(Array.isArray(result.conversationMessages)).toBe(true);
+
+    expect(suspensionsStore.insertPending).toHaveBeenCalledTimes(1);
+    const inserted = suspensionsStore.insertPending.mock.calls[0][0];
+    expect(inserted).toMatchObject({
+      id: result.suspensionId,
+      agentId: AGENT_ID,
+      toolCallId: 'c1',
+      toolName: 'risky',
+      approvalId: 'a1',
+    });
+    expect(typeof inserted.conversationMessagesJson).toBe('string');
+    expect(JSON.parse(inserted.toolArgsJson)).toEqual({ ammo: 'live' });
+    expect(JSON.parse(inserted.conversationMessagesJson)).toEqual(result.conversationMessages);
+    expect(inserted.idempotencyKey).toBe(`${result.suspensionId}:a1`);
+  });
+
+  it('persists taskId and configOverride when supplied', async () => {
+    const factory = makeClientFactory([
+      makeResponse({
+        message: makeAssistantMessage({
+          tool_calls: [makeToolCall({ id: 'c1', name: 'risky' })],
+        }),
+      }),
+    ]);
+    const suspensionsStore = makeStubSuspensionsStore();
+    const deps = makeBaseDeps({
+      clientFactory: factory,
+      dispatchRemoteTool: vi.fn(async () => ({
+        ok: false,
+        code: 'APPROVAL_PENDING',
+        approvalId: 'a1',
+        name: 'risky',
+        args: {},
+      })),
+      suspensionsStore,
+    });
+    const handler = createBrainToolLoopHandler(deps);
+    const configOverride = { provider: 'openai', model: 'gpt-test' };
+    await handler(validPayload({
+      tools: [{ name: 'risky', executor: 'remote' }],
+      taskId: 'task-42',
+      configOverride,
+    }), {});
+
+    const inserted = suspensionsStore.insertPending.mock.calls[0][0];
+    expect(inserted.taskId).toBe('task-42');
+    expect(JSON.parse(inserted.configOverrideJson)).toEqual(configOverride);
+    expect(JSON.parse(inserted.toolContextJson)).toMatchObject({
+      agentId: AGENT_ID,
+      taskId: 'task-42',
+    });
+  });
+
+  it('computes max_tool_rounds_remaining as effectiveMaxToolRounds minus round reached', async () => {
+    // Two rounds of normal tool calls (local), then a third round whose
+    // remote tool surfaces APPROVAL_PENDING. effectiveMaxToolRounds=5,
+    // suspension hits round=3, so remaining = 5-3 = 2.
+    const factory = makeClientFactory([
+      makeResponse({
+        message: makeAssistantMessage({
+          tool_calls: [makeToolCall({ id: 'c1', name: 'safe' })],
+        }),
+      }),
+      makeResponse({
+        message: makeAssistantMessage({
+          tool_calls: [makeToolCall({ id: 'c2', name: 'safe' })],
+        }),
+      }),
+      makeResponse({
+        message: makeAssistantMessage({
+          tool_calls: [makeToolCall({ id: 'c3', name: 'risky' })],
+        }),
+      }),
+    ]);
+    const suspensionsStore = makeStubSuspensionsStore();
+    const deps = makeBaseDeps({
+      clientFactory: factory,
+      dispatchLocalTool: vi.fn(async () => ({ content: 'ok' })),
+      dispatchRemoteTool: vi.fn(async () => ({
+        ok: false,
+        code: 'APPROVAL_PENDING',
+        approvalId: 'a1',
+        name: 'risky',
+        args: {},
+      })),
+      suspensionsStore,
+    });
+    const handler = createBrainToolLoopHandler(deps);
+    const result = await handler(validPayload({
+      tools: [
+        { name: 'safe', executor: 'local' },
+        { name: 'risky', executor: 'remote' },
+      ],
+      maxToolRounds: 5,
+    }), {});
+
+    expect(result.status).toBe('approval_pending');
+    const inserted = suspensionsStore.insertPending.mock.calls[0][0];
+    expect(inserted.maxToolRoundsRemaining).toBe(2);
+  });
+
+  it('rejects with SUSPENSIONS_UNAVAILABLE when no store is wired', async () => {
     const factory = makeClientFactory([
       makeResponse({
         message: makeAssistantMessage({
@@ -434,6 +579,7 @@ describe('brain.toolLoop handler — APPROVAL_PENDING surfaces NOT_READY', () =>
         name: 'risky',
         args: {},
       })),
+      // suspensionsStore intentionally omitted.
     });
     const handler = createBrainToolLoopHandler(deps);
     await expectJsonRpcApplicationError(
@@ -442,7 +588,7 @@ describe('brain.toolLoop handler — APPROVAL_PENDING surfaces NOT_READY', () =>
       }), {})),
       (err) => {
         expect(err.jsonRpc.data).toMatchObject({
-          code: 'BRAIN_TOOL_LOOP_APPROVAL_NOT_READY',
+          code: 'BRAIN_TOOL_LOOP_SUSPENSIONS_UNAVAILABLE',
           retryable: false,
           approvalId: 'a1',
           toolName: 'risky',

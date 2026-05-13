@@ -83,6 +83,7 @@ import { resolveAiConfig, setAiConfig } from '../src/lib/resolveAiConfig.js';
 import { registerDaemonIpcHandlers } from '../src/handlers/daemon-ipc-handlers.js';
 import { registerGovernanceDelegateHandler } from '../src/handlers/governance-delegate-handler.js';
 import { registerBrainToolLoopHandler } from '../src/handlers/brain-tool-loop-handler.js';
+import { registerBrainToolLoopResumeHandler } from '../src/handlers/brain-tool-loop-resume-handler.js';
 import {
   setAthenaMode,
   getAthenaModeAllowlist,
@@ -676,14 +677,28 @@ async function main() {
   // tool calls returned by the provider are dispatched to either the
   // daemon-local `tool.invoke` kernel handler or the Space-side
   // `space.tool.invoke` IPC method based on each tool's `executor` field.
-  // Approval-pending and streaming variants are wired in follow-up
-  // commits.
+  // Approval-pending suspensions are persisted to agent-core.db so the
+  // upstream caller can replay via brain.toolLoop.resume; the streaming
+  // variant is wired in a follow-up commit.
   registerBrainToolLoopHandler(kernel, {
     agentId,
     brainConfig: config.brainConfig ?? null,
     aiConfigResolver: resolveAiConfig,
     sendNotification,
     ipcAdapter,
+    agentCoreDb,
+  });
+
+  // Resume handler for approval-pending suspensions. Shares the
+  // suspensions table backed by agent-core.db so a daemon restart
+  // between suspend and resume sees the same durable state.
+  registerBrainToolLoopResumeHandler(kernel, {
+    agentId,
+    brainConfig: config.brainConfig ?? null,
+    aiConfigResolver: resolveAiConfig,
+    sendNotification,
+    ipcAdapter,
+    agentCoreDb,
   });
 
   // S6b — Full SIGTERM handler (M51). Replaces the S6a early stub.

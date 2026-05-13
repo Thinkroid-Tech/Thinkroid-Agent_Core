@@ -19,11 +19,14 @@
 //   - When `maxToolRounds` is hit, the loop resolves with
 //     `status: 'failed'` and a diagnostic text.
 //   - When a remote tool returns the approval-pending envelope, the
-//     handler raises `BRAIN_TOOL_LOOP_APPROVAL_NOT_READY`. Durable
-//     suspension persistence is wired in a follow-up commit.
+//     handler persists a durable suspension row and resolves with
+//     `status: 'approval_pending'` + the new suspensionId. The caller
+//     replays via `brain.toolLoop.resume` once the approval is recorded.
 //
 // Token usage is accumulated across rounds and emitted as a single
 // `token_usage` notification at the end (mirroring brain.chat's flow).
+
+import { randomUUID } from 'node:crypto';
 
 import { IPC_ERROR_CODES } from '../adapters/ipc-errors.js';
 import { throwJsonRpcError } from '../kernel.js';
@@ -32,6 +35,7 @@ import { IPC_METHOD_TIMEOUTS_MS } from '../adapters/ipc-timeouts.js';
 import { createAIClient } from '../lib/llm-provider/openai-compatible-client.js';
 import { callWithRetry as defaultCallWithRetry } from '../lib/llm-provider/retry.js';
 import { resolveAiConfig as defaultResolveAiConfig } from '../lib/resolveAiConfig.js';
+import { ToolLoopSuspensionsStore } from '../stores/agent-core-db/tool-loop-suspensions-store.js';
 
 const METHOD = 'brain.toolLoop';
 
@@ -55,7 +59,7 @@ function validateRequest(params, boundAgentId) {
   }
 }
 
-function emitTokenUsage({ sendNotification, agentId, usage }) {
+export function emitTokenUsage({ sendNotification, agentId, usage }) {
   if (typeof sendNotification !== 'function') return;
   if (!usage || typeof usage !== 'object') return;
   try {
@@ -89,7 +93,7 @@ function stripExecutorFromTools(tools) {
   });
 }
 
-function accumulateUsage(target, usage) {
+export function accumulateUsage(target, usage) {
   if (!usage || typeof usage !== 'object') return target;
   const prompt = Number(usage.prompt_tokens) || 0;
   const completion = Number(usage.completion_tokens) || 0;
@@ -104,7 +108,7 @@ function accumulateUsage(target, usage) {
   return target;
 }
 
-function resolveLoopConfig({ agentId, aiConfigResolver, brainConfig, configOverride }) {
+export function resolveLoopConfig({ agentId, aiConfigResolver, brainConfig, configOverride }) {
   const hasOverride = configOverride !== undefined && configOverride !== null;
   const resolved =
     aiConfigResolver(agentId, hasOverride ? { configOverride } : undefined) ??
@@ -134,6 +138,215 @@ async function runProviderRound({ client, retry, request, signal }) {
 }
 
 /**
+ * Build the per-round outcome envelope shapes returned by
+ * `runToolLoopRounds`. The function returns one of:
+ *
+ *   { kind: 'completed', text, conversationMessages, aggregatedUsage, observedAnyUsage }
+ *   { kind: 'failed', text, conversationMessages, aggregatedUsage, observedAnyUsage }
+ *   { kind: 'approval_pending', toolCallId, toolName, args, envelope,
+ *     conversationMessages, roundReached, aggregatedUsage, observedAnyUsage }
+ *
+ * The caller is responsible for wrapping the outcome into the final IPC
+ * response envelope, emitting `token_usage` when `observedAnyUsage`, and
+ * (for approval_pending) persisting the suspension row.
+ *
+ * Shared between the initial `brain.toolLoop` handler and the
+ * `brain.toolLoop.resume` handler so the round-driving logic stays in
+ * one place.
+ *
+ * @param {{
+ *   client: object,
+ *   callWithRetry: Function,
+ *   resolvedConfig: { model: string, maxTokens?: number },
+ *   workingMessages: Array<object>,
+ *   toolsByName: Map<string, object>,
+ *   providerTools: Array<object>|undefined,
+ *   dispatchLocalTool: Function,
+ *   dispatchRemoteTool: Function,
+ *   toolCtx: object,
+ *   effectiveMaxTokens: number|undefined,
+ *   effectiveMaxToolRounds: number,
+ *   signal: AbortSignal|null,
+ * }} args
+ */
+export async function runToolLoopRounds({
+  client,
+  callWithRetry,
+  resolvedConfig,
+  workingMessages,
+  toolsByName,
+  providerTools,
+  dispatchLocalTool,
+  dispatchRemoteTool,
+  toolCtx,
+  effectiveMaxTokens,
+  effectiveMaxToolRounds,
+  signal,
+}) {
+  const aggregatedUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+  let observedAnyUsage = false;
+
+  for (let round = 1; round <= effectiveMaxToolRounds; round += 1) {
+    const request = {
+      model: resolvedConfig.model,
+      messages: workingMessages,
+      stream: false,
+    };
+    if (providerTools && providerTools.length > 0) {
+      request.tools = providerTools;
+    }
+    if (Number.isFinite(effectiveMaxTokens) && effectiveMaxTokens > 0) {
+      request.max_tokens = effectiveMaxTokens;
+    }
+
+    let response;
+    try {
+      response = await runProviderRound({
+        client,
+        retry: callWithRetry,
+        request,
+        signal,
+      });
+    } catch (err) {
+      return {
+        kind: 'provider_error',
+        message: `provider error: ${err?.message ?? err}`,
+        cause: err?.message ?? String(err),
+        aggregatedUsage,
+        observedAnyUsage,
+      };
+    }
+
+    if (response?.usage) {
+      observedAnyUsage = true;
+      accumulateUsage(aggregatedUsage, response.usage);
+    }
+
+    const message = response?.choices?.[0]?.message;
+    if (!message || typeof message !== 'object') {
+      return {
+        kind: 'provider_error',
+        message: 'provider returned no assistant message',
+        cause: null,
+        aggregatedUsage,
+        observedAnyUsage,
+      };
+    }
+
+    // Append the assistant message verbatim so the next round (or the
+    // caller's persistence layer) sees the exact tool_calls payload.
+    workingMessages.push(message);
+
+    const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+    if (toolCalls.length === 0) {
+      const finalText = typeof message.content === 'string' ? message.content : '';
+      return {
+        kind: 'completed',
+        text: finalText,
+        conversationMessages: workingMessages,
+        aggregatedUsage,
+        observedAnyUsage,
+      };
+    }
+
+    // Dispatch each tool call in order.
+    for (const call of toolCalls) {
+      const toolCallId = call?.id ?? null;
+      const fnName = call?.function?.name;
+      const rawArgs = call?.function?.arguments;
+      const args = parseToolArgs(rawArgs);
+
+      if (typeof fnName !== 'string' || fnName.length === 0 || !toolsByName.has(fnName)) {
+        workingMessages.push({
+          role: 'tool',
+          tool_call_id: toolCallId,
+          content: `Unknown tool: ${fnName ?? ''}`,
+          isToolError: true,
+        });
+        continue;
+      }
+
+      const toolDef = toolsByName.get(fnName);
+      const dispatch = toolDef.executor === 'local' ? dispatchLocalTool : dispatchRemoteTool;
+
+      let envelope;
+      try {
+        envelope = await dispatch({ name: fnName, args, ctx: toolCtx });
+      } catch (err) {
+        // Class B kernel-level throw: wrap into a Class A tool-error
+        // message and continue the loop so the LLM can recover.
+        workingMessages.push({
+          role: 'tool',
+          tool_call_id: toolCallId,
+          content: `Tool execution failed: ${err?.message ?? String(err)}`,
+          isToolError: true,
+        });
+        continue;
+      }
+
+      // Normalize the local-tool dispatch shape: kernel `tool.invoke`
+      // returns `{ result: <envelope> }` per its handler contract,
+      // while `space.tool.invoke` returns the envelope directly. The
+      // dispatch* seam is allowed to do that unwrap on the way out,
+      // but we defensively unwrap a `{ result }` shell here too.
+      if (
+        envelope &&
+        typeof envelope === 'object' &&
+        !Array.isArray(envelope) &&
+        'result' in envelope &&
+        Object.keys(envelope).length === 1
+      ) {
+        envelope = envelope.result;
+      }
+
+      if (
+        envelope &&
+        typeof envelope === 'object' &&
+        envelope.ok === false &&
+        envelope.code === 'APPROVAL_PENDING'
+      ) {
+        return {
+          kind: 'approval_pending',
+          toolCallId,
+          toolName: fnName,
+          args,
+          envelope,
+          conversationMessages: workingMessages,
+          roundReached: round,
+          aggregatedUsage,
+          observedAnyUsage,
+        };
+      }
+
+      // Class A success / tool-error envelope: `{ content, isToolError? }`.
+      const content = typeof envelope?.content === 'string'
+        ? envelope.content
+        : typeof envelope === 'string'
+          ? envelope
+          : JSON.stringify(envelope ?? '');
+      const toolMessage = {
+        role: 'tool',
+        tool_call_id: toolCallId,
+        content,
+      };
+      if (envelope && typeof envelope === 'object' && envelope.isToolError === true) {
+        toolMessage.isToolError = true;
+      }
+      workingMessages.push(toolMessage);
+    }
+  }
+
+  // Exceeded effectiveMaxToolRounds without the provider terminating.
+  return {
+    kind: 'failed',
+    text: `tool loop exceeded maxToolRounds (${effectiveMaxToolRounds})`,
+    conversationMessages: workingMessages,
+    aggregatedUsage,
+    observedAnyUsage,
+  };
+}
+
+/**
  * Build the brain.toolLoop handler.
  *
  * @param {{
@@ -145,6 +358,7 @@ async function runProviderRound({ client, retry, request, signal }) {
  *   dispatchLocalTool: ({ name, args, ctx }) => Promise<unknown>,
  *   dispatchRemoteTool: ({ name, args, ctx }) => Promise<unknown>,
  *   sendNotification?: (method: string, payload: object) => void,
+ *   suspensionsStore?: ToolLoopSuspensionsStore,
  * }} deps
  */
 export function createBrainToolLoopHandler({
@@ -156,6 +370,7 @@ export function createBrainToolLoopHandler({
   dispatchLocalTool,
   dispatchRemoteTool,
   sendNotification,
+  suspensionsStore = null,
 }) {
   if (!agentId) {
     throw new TypeError('createBrainToolLoopHandler requires agentId');
@@ -212,183 +427,131 @@ export function createBrainToolLoopHandler({
     };
 
     const effectiveMaxTokens = params.maxTokens ?? resolvedConfig.maxTokens;
-    const aggregatedUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
-    let observedAnyUsage = false;
     const signal = kernelCtx?.signal ?? null;
 
-    for (let round = 1; round <= effectiveMaxToolRounds; round += 1) {
-      const request = {
-        model: resolvedConfig.model,
-        messages: workingMessages,
-        stream: false,
-      };
-      if (providerTools && providerTools.length > 0) {
-        request.tools = providerTools;
+    const outcome = await runToolLoopRounds({
+      client,
+      callWithRetry,
+      resolvedConfig,
+      workingMessages,
+      toolsByName,
+      providerTools,
+      dispatchLocalTool,
+      dispatchRemoteTool,
+      toolCtx,
+      effectiveMaxTokens,
+      effectiveMaxToolRounds,
+      signal,
+    });
+
+    if (outcome.kind === 'provider_error') {
+      if (outcome.observedAnyUsage) {
+        emitTokenUsage({ sendNotification, agentId, usage: outcome.aggregatedUsage });
       }
-      if (Number.isFinite(effectiveMaxTokens) && effectiveMaxTokens > 0) {
-        request.max_tokens = effectiveMaxTokens;
-      }
-
-      let response;
-      try {
-        response = await runProviderRound({
-          client,
-          retry: callWithRetry,
-          request,
-          signal,
-        });
-      } catch (err) {
-        if (observedAnyUsage) {
-          emitTokenUsage({ sendNotification, agentId, usage: aggregatedUsage });
-        }
-        rejectApplication(`provider error: ${err?.message ?? err}`, {
-          code: 'BRAIN_TOOL_LOOP_PROVIDER_ERROR',
-          retryable: true,
-          cause: err?.message ?? String(err),
-        });
-      }
-
-      if (response?.usage) {
-        observedAnyUsage = true;
-        accumulateUsage(aggregatedUsage, response.usage);
-      }
-
-      const message = response?.choices?.[0]?.message;
-      if (!message || typeof message !== 'object') {
-        if (observedAnyUsage) {
-          emitTokenUsage({ sendNotification, agentId, usage: aggregatedUsage });
-        }
-        rejectApplication('provider returned no assistant message', {
-          code: 'BRAIN_TOOL_LOOP_PROVIDER_ERROR',
-          retryable: true,
-        });
-      }
-
-      // Append the assistant message verbatim so the next round (or the
-      // caller's persistence layer) sees the exact tool_calls payload.
-      workingMessages.push(message);
-
-      const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
-      if (toolCalls.length === 0) {
-        if (observedAnyUsage) {
-          emitTokenUsage({ sendNotification, agentId, usage: aggregatedUsage });
-        }
-        const finalText = typeof message.content === 'string' ? message.content : '';
-        const envelope = {
-          ok: true,
-          text: finalText,
-          agentId,
-          status: 'completed',
-          conversationMessages: workingMessages,
-        };
-        if (observedAnyUsage) envelope.usage = aggregatedUsage;
-        return envelope;
-      }
-
-      // Dispatch each tool call in order.
-      for (const call of toolCalls) {
-        const toolCallId = call?.id ?? null;
-        const fnName = call?.function?.name;
-        const rawArgs = call?.function?.arguments;
-        const args = parseToolArgs(rawArgs);
-
-        if (typeof fnName !== 'string' || fnName.length === 0 || !toolsByName.has(fnName)) {
-          workingMessages.push({
-            role: 'tool',
-            tool_call_id: toolCallId,
-            content: `Unknown tool: ${fnName ?? ''}`,
-            isToolError: true,
-          });
-          continue;
-        }
-
-        const toolDef = toolsByName.get(fnName);
-        const dispatch = toolDef.executor === 'local' ? dispatchLocalTool : dispatchRemoteTool;
-
-        let envelope;
-        try {
-          envelope = await dispatch({ name: fnName, args, ctx: toolCtx });
-        } catch (err) {
-          // Class B kernel-level throw: wrap into a Class A tool-error
-          // message and continue the loop so the LLM can recover.
-          workingMessages.push({
-            role: 'tool',
-            tool_call_id: toolCallId,
-            content: `Tool execution failed: ${err?.message ?? String(err)}`,
-            isToolError: true,
-          });
-          continue;
-        }
-
-        // Normalize the local-tool dispatch shape: kernel `tool.invoke`
-        // returns `{ result: <envelope> }` per its handler contract,
-        // while `space.tool.invoke` returns the envelope directly. The
-        // dispatch* seam is allowed to do that unwrap on the way out,
-        // but we defensively unwrap a `{ result }` shell here too.
-        if (
-          envelope &&
-          typeof envelope === 'object' &&
-          !Array.isArray(envelope) &&
-          'result' in envelope &&
-          Object.keys(envelope).length === 1
-        ) {
-          envelope = envelope.result;
-        }
-
-        if (
-          envelope &&
-          typeof envelope === 'object' &&
-          envelope.ok === false &&
-          envelope.code === 'APPROVAL_PENDING'
-        ) {
-          // Durable suspension persistence lands in a follow-up commit.
-          // For now, surface an explicit not-ready signal so callers
-          // see the deferred capability instead of a silent stall.
-          if (observedAnyUsage) {
-            emitTokenUsage({ sendNotification, agentId, usage: aggregatedUsage });
-          }
-          rejectApplication(
-            `tool ${fnName} returned APPROVAL_PENDING but durable suspension is not yet implemented`,
-            {
-              code: 'BRAIN_TOOL_LOOP_APPROVAL_NOT_READY',
-              retryable: false,
-              approvalId: envelope.approvalId ?? null,
-              toolName: fnName,
-              toolCallId,
-            },
-          );
-        }
-
-        // Class A success / tool-error envelope: `{ content, isToolError? }`.
-        const content = typeof envelope?.content === 'string'
-          ? envelope.content
-          : typeof envelope === 'string'
-            ? envelope
-            : JSON.stringify(envelope ?? '');
-        const toolMessage = {
-          role: 'tool',
-          tool_call_id: toolCallId,
-          content,
-        };
-        if (envelope && typeof envelope === 'object' && envelope.isToolError === true) {
-          toolMessage.isToolError = true;
-        }
-        workingMessages.push(toolMessage);
-      }
+      rejectApplication(outcome.message, {
+        code: 'BRAIN_TOOL_LOOP_PROVIDER_ERROR',
+        retryable: true,
+        ...(outcome.cause ? { cause: outcome.cause } : {}),
+      });
     }
 
-    // Exceeded maxToolRounds without the provider terminating.
-    if (observedAnyUsage) {
-      emitTokenUsage({ sendNotification, agentId, usage: aggregatedUsage });
+    if (outcome.kind === 'completed') {
+      if (outcome.observedAnyUsage) {
+        emitTokenUsage({ sendNotification, agentId, usage: outcome.aggregatedUsage });
+      }
+      const envelope = {
+        ok: true,
+        text: outcome.text,
+        agentId,
+        status: 'completed',
+        conversationMessages: outcome.conversationMessages,
+      };
+      if (outcome.observedAnyUsage) envelope.usage = outcome.aggregatedUsage;
+      return envelope;
+    }
+
+    if (outcome.kind === 'approval_pending') {
+      if (!suspensionsStore) {
+        if (outcome.observedAnyUsage) {
+          emitTokenUsage({ sendNotification, agentId, usage: outcome.aggregatedUsage });
+        }
+        rejectApplication(
+          `tool ${outcome.toolName} returned APPROVAL_PENDING but daemon suspensions store is not wired`,
+          {
+            code: 'BRAIN_TOOL_LOOP_SUSPENSIONS_UNAVAILABLE',
+            retryable: false,
+            approvalId: outcome.envelope.approvalId ?? null,
+            toolName: outcome.toolName,
+            toolCallId: outcome.toolCallId,
+          },
+        );
+      }
+
+      const suspensionId = randomUUID();
+      const maxToolRoundsRemaining = effectiveMaxToolRounds - outcome.roundReached;
+      const approvalId = outcome.envelope.approvalId ?? null;
+
+      try {
+        suspensionsStore.insertPending({
+          id: suspensionId,
+          agentId,
+          taskId: typeof params.taskId === 'string' && params.taskId.length > 0 ? params.taskId : null,
+          sessionId: null,
+          toolCallId: outcome.toolCallId,
+          toolName: outcome.toolName,
+          toolArgsJson: JSON.stringify(outcome.args ?? null),
+          toolContextJson: JSON.stringify(toolCtx ?? null),
+          conversationMessagesJson: JSON.stringify(outcome.conversationMessages),
+          maxTokens: Number.isFinite(effectiveMaxTokens) ? effectiveMaxTokens : null,
+          maxToolRoundsRemaining,
+          approvalId,
+          idempotencyKey: `${suspensionId}:${approvalId ?? 'none'}`,
+          configOverrideJson: params.configOverride ? JSON.stringify(params.configOverride) : null,
+        });
+      } catch (err) {
+        if (outcome.observedAnyUsage) {
+          emitTokenUsage({ sendNotification, agentId, usage: outcome.aggregatedUsage });
+        }
+        rejectApplication(
+          `failed to persist tool loop suspension: ${err?.message ?? err}`,
+          {
+            code: 'BRAIN_TOOL_LOOP_SUSPENSION_PERSIST_FAILED',
+            retryable: false,
+            toolName: outcome.toolName,
+            toolCallId: outcome.toolCallId,
+          },
+        );
+      }
+
+      if (outcome.observedAnyUsage) {
+        emitTokenUsage({ sendNotification, agentId, usage: outcome.aggregatedUsage });
+      }
+
+      const envelope = {
+        ok: true,
+        text: '',
+        agentId,
+        status: 'approval_pending',
+        suspensionId,
+        toolCallId: outcome.toolCallId,
+        conversationMessages: outcome.conversationMessages,
+      };
+      if (outcome.observedAnyUsage) envelope.usage = outcome.aggregatedUsage;
+      return envelope;
+    }
+
+    // outcome.kind === 'failed'
+    if (outcome.observedAnyUsage) {
+      emitTokenUsage({ sendNotification, agentId, usage: outcome.aggregatedUsage });
     }
     const envelope = {
       ok: true,
-      text: `tool loop exceeded maxToolRounds (${effectiveMaxToolRounds})`,
+      text: outcome.text,
       agentId,
       status: 'failed',
-      conversationMessages: workingMessages,
+      conversationMessages: outcome.conversationMessages,
     };
-    if (observedAnyUsage) envelope.usage = aggregatedUsage;
+    if (outcome.observedAnyUsage) envelope.usage = outcome.aggregatedUsage;
     return envelope;
   };
 }
@@ -398,6 +561,10 @@ export function createBrainToolLoopHandler({
  * `dispatchLocalTool` / `dispatchRemoteTool` callables wired into the
  * daemon-local `tool.invoke` kernel handler and the `space.tool.invoke`
  * IPC method respectively. Either may be overridden via deps for tests.
+ *
+ * When `agentCoreDb` is supplied, a `ToolLoopSuspensionsStore` is built
+ * from it and forwarded so APPROVAL_PENDING dispatches persist durable
+ * suspension rows.
  */
 export function registerBrainToolLoopHandler(kernel, deps) {
   if (!kernel) {
@@ -413,6 +580,8 @@ export function registerBrainToolLoopHandler(kernel, deps) {
     dispatchLocalTool,
     dispatchRemoteTool,
     ipcAdapter,
+    agentCoreDb,
+    suspensionsStore: suppliedStore,
   } = deps ?? {};
   if (!agentId) {
     throw new TypeError('registerBrainToolLoopHandler requires agentId');
@@ -441,6 +610,9 @@ export function registerBrainToolLoopHandler(kernel, deps) {
       );
     };
 
+  const suspensionsStore = suppliedStore
+    ?? (agentCoreDb ? new ToolLoopSuspensionsStore(agentCoreDb) : null);
+
   kernel.registerHandler(
     METHOD,
     createBrainToolLoopHandler({
@@ -452,6 +624,7 @@ export function registerBrainToolLoopHandler(kernel, deps) {
       dispatchLocalTool: effectiveDispatchLocal,
       dispatchRemoteTool: effectiveDispatchRemote,
       sendNotification,
+      suspensionsStore,
     }),
   );
 }
