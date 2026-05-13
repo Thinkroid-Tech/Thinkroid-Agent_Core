@@ -82,6 +82,7 @@ import { createBrainChatHandler } from '../src/lib/brain-chat-handler.js';
 import { resolveAiConfig, setAiConfig } from '../src/lib/resolveAiConfig.js';
 import { registerDaemonIpcHandlers } from '../src/handlers/daemon-ipc-handlers.js';
 import { registerGovernanceDelegateHandler } from '../src/handlers/governance-delegate-handler.js';
+import { registerBrainToolLoopHandler } from '../src/handlers/brain-tool-loop-handler.js';
 import {
   setAthenaMode,
   getAthenaModeAllowlist,
@@ -669,6 +670,20 @@ async function main() {
     brainConfig: config.brainConfig ?? null,
     aiConfigResolver: resolveAiConfig,
     sendNotification,
+  });
+
+  // Non-streaming multi-round tool loop. The daemon owns the LLM call;
+  // tool calls returned by the provider are dispatched to either the
+  // daemon-local `tool.invoke` kernel handler or the Space-side
+  // `space.tool.invoke` IPC method based on each tool's `executor` field.
+  // Approval-pending and streaming variants are wired in follow-up
+  // commits.
+  registerBrainToolLoopHandler(kernel, {
+    agentId,
+    brainConfig: config.brainConfig ?? null,
+    aiConfigResolver: resolveAiConfig,
+    sendNotification,
+    ipcAdapter,
   });
 
   // S6b — Full SIGTERM handler (M51). Replaces the S6a early stub.

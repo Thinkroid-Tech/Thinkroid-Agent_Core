@@ -170,6 +170,57 @@ const REQUEST_CONTRACTS = Object.freeze({
       'options must be an object when provided',
     ],
   }),
+  'brain.toolLoop': makeRequestContract({
+    method: 'brain.toolLoop',
+    timeoutMs: 300_000,
+    idempotency: 'non_idempotent',
+    // Approval-pending paths persist suspensions in a follow-up commit;
+    // mark mutating now to keep the scheduler honest.
+    mutatesDaemonDb: true,
+    scheduler: DEFAULT_SCHEDULER,
+    requestShape: {
+      agentId: 'UUID string',
+      messages: 'non-empty array of {role,content} entries',
+      tools: 'optional array of tool definitions with {name, description?, parameters?, executor: "local"|"remote"}',
+      toolContext: 'optional object — opaque, forwarded to remote tools',
+      maxTokens: 'optional positive integer',
+      maxToolRounds: 'optional positive integer; default 25, hard-cap 50',
+      taskId: 'optional non-empty string',
+      skipInterruptCheck: 'optional boolean',
+      configOverride: 'optional object',
+      correlationId: 'optional non-empty string',
+      source: 'non-empty string',
+    },
+    responseShape: {
+      ok: 'boolean',
+      text: 'string',
+      agentId: 'UUID string',
+      status: '"completed" | "approval_pending" | "interrupted" | "failed"',
+      usage: 'optional object',
+      suspensionId: 'optional string — set when status==="approval_pending"',
+      toolCallId: 'optional string — set when status==="approval_pending"',
+      conversationMessages: 'optional array — full message history including tool calls/results, for caller persistence',
+    },
+    validationErrors: [
+      'payload must be an object',
+      'agentId must be a UUID string',
+      'source must be a non-empty string',
+      'messages must be a non-empty array of {role,content} entries',
+      'messages[i].role must be a non-empty string',
+      'messages[i].content must be a non-empty string',
+      'tools must be an array when provided',
+      'tools[i] must have a non-empty string name',
+      'tools[i].executor must be "local" or "remote"',
+      'toolContext must be an object when provided',
+      'maxTokens must be a positive integer when provided',
+      'maxToolRounds must be a positive integer when provided',
+      'maxToolRounds must not exceed 50',
+      'taskId must be a non-empty string when provided',
+      'skipInterruptCheck must be a boolean when provided',
+      'configOverride must be an object when provided',
+      'correlationId must be a non-empty string when provided',
+    ],
+  }),
   'governance.delegate': makeRequestContract({
     method: 'governance.delegate',
     timeoutMs: 120_000,
@@ -330,6 +381,20 @@ export function validateRequestPayload(method, payload) {
         ...optionalNonEmptyString(payload.correlationId, 'correlationId'),
         ...validateGovernanceValidDecisions(payload.responseFormat, payload.validDecisions),
       ]);
+    case 'brain.toolLoop':
+      return validationResult([
+        ...requireUuidString(payload.agentId, 'agentId'),
+        ...requireNonEmptyString(payload.source, 'source'),
+        ...validateGovernanceMessages(payload.messages),
+        ...validateBrainToolLoopTools(payload.tools),
+        ...optionalPlainObject(payload.toolContext, 'toolContext'),
+        ...optionalPositiveInteger(payload.maxTokens, 'maxTokens'),
+        ...validateMaxToolRounds(payload.maxToolRounds),
+        ...optionalNonEmptyString(payload.taskId, 'taskId'),
+        ...optionalBoolean(payload.skipInterruptCheck, 'skipInterruptCheck'),
+        ...optionalPlainObject(payload.configOverride, 'configOverride'),
+        ...optionalNonEmptyString(payload.correlationId, 'correlationId'),
+      ]);
     default:
       return invalid(`unknown request method: ${method}`);
   }
@@ -378,6 +443,17 @@ export function validateResponsePayload(method, payload) {
         ...requireUuidString(payload.agentId, 'agentId'),
         ...requireNonEmptyString(payload.capability, 'capability'),
         ...optionalBoolean(payload.parsedOk, 'parsedOk'),
+      ]);
+    case 'brain.toolLoop':
+      return validationResult([
+        ...requireBoolean(payload.ok, 'ok'),
+        ...requireString(payload.text, 'text'),
+        ...requireUuidString(payload.agentId, 'agentId'),
+        ...validateBrainToolLoopStatus(payload.status),
+        ...optionalPlainObject(payload.usage, 'usage'),
+        ...optionalNonEmptyString(payload.suspensionId, 'suspensionId'),
+        ...optionalNonEmptyString(payload.toolCallId, 'toolCallId'),
+        ...optionalArray(payload.conversationMessages, 'conversationMessages'),
       ]);
     default:
       return invalid(`unknown request method: ${method}`);
@@ -609,3 +685,54 @@ function validateGovernanceValidDecisions(responseFormat, validDecisions) {
 // underscores — keeping decision words safe to interpolate into prompts and
 // downstream consumers.
 const VALID_DECISION_TOKEN_PATTERN = /^[A-Z][A-Z0-9_]*$/;
+
+const BRAIN_TOOL_LOOP_MAX_ROUNDS_CAP = 50;
+const BRAIN_TOOL_LOOP_STATUSES = ['completed', 'approval_pending', 'interrupted', 'failed'];
+const BRAIN_TOOL_LOOP_EXECUTORS = ['local', 'remote'];
+
+function optionalArray(value, field) {
+  if (value === undefined) return [];
+  return Array.isArray(value) ? [] : [`${field} must be an array when provided`];
+}
+
+function validateBrainToolLoopTools(tools) {
+  if (tools === undefined) return [];
+  if (!Array.isArray(tools)) {
+    return ['tools must be an array when provided'];
+  }
+  const errors = [];
+  for (let i = 0; i < tools.length; i += 1) {
+    const entry = tools[i];
+    if (!isPlainObject(entry)) {
+      errors.push(`tools[${i}] must have a non-empty string name`);
+      continue;
+    }
+    if (typeof entry.name !== 'string' || entry.name.length === 0) {
+      errors.push(`tools[${i}] must have a non-empty string name`);
+    }
+    if (
+      typeof entry.executor !== 'string' ||
+      !BRAIN_TOOL_LOOP_EXECUTORS.includes(entry.executor)
+    ) {
+      errors.push(`tools[${i}].executor must be "local" or "remote"`);
+    }
+  }
+  return errors;
+}
+
+function validateMaxToolRounds(value) {
+  if (value === undefined) return [];
+  if (!Number.isInteger(value) || value <= 0) {
+    return ['maxToolRounds must be a positive integer when provided'];
+  }
+  if (value > BRAIN_TOOL_LOOP_MAX_ROUNDS_CAP) {
+    return ['maxToolRounds must not exceed 50'];
+  }
+  return [];
+}
+
+function validateBrainToolLoopStatus(value) {
+  return typeof value === 'string' && BRAIN_TOOL_LOOP_STATUSES.includes(value)
+    ? []
+    : [`status must be one of ${BRAIN_TOOL_LOOP_STATUSES.join(', ')}`];
+}

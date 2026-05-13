@@ -25,6 +25,7 @@ export const IPC_METHOD_TIMEOUTS_MS = Object.freeze({
   'memory.write': 30_000,
   'session.receiveEvent': 30_000,
   'governance.delegate': 120_000,
+  'brain.toolLoop': 300_000,
   '_test.echo': 5_000,
   '_test.echo_stream': 5_000,
 });

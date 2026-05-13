@@ -26,6 +26,7 @@ describe('agent-core IPC contract', () => {
       'memory.read',
       'memory.write',
       'session.receiveEvent',
+      'brain.toolLoop',
       'governance.delegate',
     ]);
 
