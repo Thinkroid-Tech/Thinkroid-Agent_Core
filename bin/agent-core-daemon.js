@@ -657,14 +657,18 @@ async function main() {
     brainConfig: config.brainConfig ?? null,
   });
 
-  // Phase 16γ.B.4a Commit #1 — register the `governance.delegate` IPC
-  // handler. The stub returned at this point validates the locked
-  // contract surface and rejects every request with a not-ready error
-  // until Commit #2 wires real per-agent Brain execution. Registered
-  // here so the handler is in place before `daemon:ready` is emitted.
+  // Phase 16γ.B.4a Commit #2 — register the real `governance.delegate`
+  // IPC handler. The handler resolves the daemon-local text-chat shim
+  // (same provider wiring as the CE channel), runs single-round text
+  // completion against the bound agent's provider config, and emits the
+  // `token_usage` notification when usage is reported — mirroring the
+  // brain.chat handler's onTokenUsage path above.
   registerGovernanceDelegateHandler(kernel, {
     agentId,
     agentName: config.agentName ?? null,
+    brainConfig: config.brainConfig ?? null,
+    aiConfigResolver: resolveAiConfig,
+    sendNotification,
   });
 
   // S6b — Full SIGTERM handler (M51). Replaces the S6a early stub.

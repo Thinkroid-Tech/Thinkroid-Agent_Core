@@ -167,7 +167,7 @@ export function createDaemonBuildSystemPrompt({ ipcAdapter, agentId, agentName }
   };
 }
 
-function createDaemonTextChat({
+export function createDaemonTextChat({
   agentId,
   brainConfig,
   aiConfigResolver = resolveAiConfig,
@@ -177,7 +177,17 @@ function createDaemonTextChat({
     messages,
     maxTokens,
     max_tokens: maxTokensSnake,
+    // `tools` is accepted on the params object so callers can declare
+    // intent (e.g. governance.delegate's tool-text path), but the daemon
+    // text shim deliberately does NOT forward it to the provider yet —
+    // the underlying streamChatCompletion still rejects tool-call signals
+    // (see createUnsupportedToolCallError). Tool-loop wiring lands in a
+    // later sub-phase; for now `tools` is captured for observability only.
+    // eslint-disable-next-line no-unused-vars
+    tools,
     configOverride,
+    onUsage,
+    signal,
   } = {}) {
     const hasConfigOverride = configOverride !== undefined && configOverride !== null;
     const resolvedConfig =
@@ -195,6 +205,8 @@ function createDaemonTextChat({
       config: resolvedConfig,
       messages,
       maxTokens: maxTokens ?? maxTokensSnake ?? resolvedConfig.maxTokens,
+      onUsage,
+      signal,
     });
     for await (const token of stream) {
       if (typeof token === 'string') text += token;
