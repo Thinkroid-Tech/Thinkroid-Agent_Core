@@ -1,7 +1,15 @@
 export const AGENT_CORE_IPC_PROTOCOL_VERSION = 'agent-core-ipc/v1';
 export const AGENT_CORE_IPC_HANDSHAKE_FIELD = 'agentCoreProtocolVersion';
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+// Loose 8-4-4-4-12 lowercase/uppercase hex pattern. Intentionally NOT the
+// strict RFC 4122 v1-v5 form: the Space side mints sentinel agent ids for
+// system actors that fall outside the version/variant nibble ranges
+// (e.g. the singleton Athena id `aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa`
+// and the system/boss `0000...0001` / `0000...0002` rows). Rejecting
+// those sentinels at the IPC boundary breaks every brain.* call routed
+// for those actors. We only need shape-level uniqueness here; uniqueness
+// across the agent table is enforced by the SQLite primary key.
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const DAEMON_UNAVAILABLE_ERROR = Object.freeze({
   code: 'AGENT_CORE_DAEMON_UNAVAILABLE',

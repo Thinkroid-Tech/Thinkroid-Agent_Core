@@ -127,6 +127,30 @@ describe('agent-core IPC contract', () => {
     expect(validateRequestPayload('cerebellum.l2Tick', { agentId: AGENT_ID })).toEqual({ ok: true, errors: [] });
   });
 
+  it('accepts Space sentinel agent ids that fall outside the strict RFC 4122 v1-5 nibble ranges', () => {
+    // The Space side mints these constants for the three system actors;
+    // they intentionally do not satisfy RFC 4122's version (1-5) and
+    // variant (8-b) nibble constraints. The IPC contract must accept
+    // them at the boundary so brain.* / memory.* / cerebellum.* calls
+    // for those actors do not get rejected as INVALID_PAYLOAD.
+    const SYSTEM_AGENT_ID = '00000000-0000-0000-0000-000000000001';
+    const BOSS_AGENT_ID = '00000000-0000-0000-0000-000000000002';
+    const ATHENA_AGENT_ID = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+
+    for (const id of [SYSTEM_AGENT_ID, BOSS_AGENT_ID, ATHENA_AGENT_ID]) {
+      expect(validateRequestPayload('ce.tick', { agentId: id })).toEqual({ ok: true, errors: [] });
+      expect(validateRequestPayload('memory.read', { agentId: id, query: 'q' })).toEqual({ ok: true, errors: [] });
+    }
+
+    // Truly malformed strings still fail.
+    for (const id of ['', 'not-a-uuid', '00000000-0000-0000-0000-00000000000', '0000-0000-0000-0000-000000000000']) {
+      expect(validateRequestPayload('ce.tick', { agentId: id })).toEqual({
+        ok: false,
+        errors: ['agentId must be a UUID string'],
+      });
+    }
+  });
+
   it('locks session.receiveEvent to event/options payload instead of sessionId', () => {
     const contract = getRequestContract('session.receiveEvent');
 
