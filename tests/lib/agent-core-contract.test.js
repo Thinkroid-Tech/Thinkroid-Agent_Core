@@ -629,6 +629,192 @@ describe('agent-core IPC contract', () => {
     });
   });
 
+  describe('brain.toolLoop / brain.chatToolStream — tools validation (OpenAI shape)', () => {
+    // The Space-side tool registry emits tools in the OpenAI function-calling
+    // shape; daemon-internal tools (e.g. `recall`) emit the same shape with
+    // `executor: 'local'`. The contract validator must accept that shape
+    // verbatim so every OpenAI-compatible upstream provider (vLLM, OpenAI,
+    // OpenRouter, ...) receives a valid `tools[]` payload after the daemon's
+    // `stripExecutorFromTools` pass.
+    const validMessages = [{ role: 'user', content: 'hi' }];
+
+    function baseToolLoopPayload(tools) {
+      return {
+        agentId: AGENT_ID,
+        source: 'test',
+        messages: validMessages,
+        tools,
+      };
+    }
+
+    function baseChatToolStreamPayload(tools) {
+      return {
+        agentId: AGENT_ID,
+        source: 'test',
+        messages: validMessages,
+        stream: true,
+        tools,
+      };
+    }
+
+    it('accepts the canonical OpenAI-shape registry fixture on brain.chatToolStream', () => {
+      // Mirrors the Space tool registry's wire shape:
+      // `{type:'function', function:{name,description,parameters}, executor:'remote'}`.
+      const tools = [
+        {
+          type: 'function',
+          function: {
+            name: 'web_fetch',
+            description: 'Fetch a URL',
+            parameters: { type: 'object', properties: { url: { type: 'string' } } },
+          },
+          executor: 'remote',
+        },
+        {
+          type: 'function',
+          function: { name: 'recall' },
+          executor: 'local',
+        },
+      ];
+      expect(validateRequestPayload('brain.chatToolStream', baseChatToolStreamPayload(tools)))
+        .toEqual({ ok: true, errors: [] });
+      expect(validateRequestPayload('brain.toolLoop', baseToolLoopPayload(tools)))
+        .toEqual({ ok: true, errors: [] });
+    });
+
+    it('accepts entries that omit the optional `type` discriminator', () => {
+      const tools = [{ function: { name: 'no_type' }, executor: 'remote' }];
+      expect(validateRequestPayload('brain.toolLoop', baseToolLoopPayload(tools)))
+        .toEqual({ ok: true, errors: [] });
+    });
+
+    it('accepts entries that omit the optional `executor` field', () => {
+      const tools = [{ type: 'function', function: { name: 'no_executor' } }];
+      expect(validateRequestPayload('brain.toolLoop', baseToolLoopPayload(tools)))
+        .toEqual({ ok: true, errors: [] });
+    });
+
+    it('accepts entries that omit description/parameters', () => {
+      const tools = [{
+        type: 'function',
+        function: { name: 'bare' },
+        executor: 'remote',
+      }];
+      expect(validateRequestPayload('brain.chatToolStream', baseChatToolStreamPayload(tools)))
+        .toEqual({ ok: true, errors: [] });
+    });
+
+    it('rejects a non-array `tools` field', () => {
+      expect(validateRequestPayload('brain.toolLoop', baseToolLoopPayload('not-array')))
+        .toEqual({ ok: false, errors: ['tools must be an array when provided'] });
+    });
+
+    it('rejects entries that are not plain objects', () => {
+      expect(validateRequestPayload('brain.toolLoop', baseToolLoopPayload(['nope'])))
+        .toEqual({ ok: false, errors: ['tools[0] must be an object'] });
+      expect(validateRequestPayload('brain.toolLoop', baseToolLoopPayload([null])))
+        .toEqual({ ok: false, errors: ['tools[0] must be an object'] });
+    });
+
+    it('rejects entries missing the function object', () => {
+      expect(validateRequestPayload('brain.toolLoop', baseToolLoopPayload([{ type: 'function', executor: 'remote' }])))
+        .toEqual({ ok: false, errors: ['tools[0].function must be an object'] });
+    });
+
+    it('rejects entries whose function object is not a plain object', () => {
+      expect(validateRequestPayload('brain.toolLoop', baseToolLoopPayload([{ function: 'web_fetch' }])))
+        .toEqual({ ok: false, errors: ['tools[0].function must be an object'] });
+      expect(validateRequestPayload('brain.toolLoop', baseToolLoopPayload([{ function: ['w'] }])))
+        .toEqual({ ok: false, errors: ['tools[0].function must be an object'] });
+    });
+
+    it('rejects entries whose function.name is missing or blank', () => {
+      expect(validateRequestPayload('brain.toolLoop', baseToolLoopPayload([{ function: {} }])))
+        .toEqual({ ok: false, errors: ['tools[0].function.name must be a non-empty string'] });
+      expect(validateRequestPayload('brain.toolLoop', baseToolLoopPayload([{ function: { name: '' } }])))
+        .toEqual({ ok: false, errors: ['tools[0].function.name must be a non-empty string'] });
+      expect(validateRequestPayload('brain.toolLoop', baseToolLoopPayload([{ function: { name: 42 } }])))
+        .toEqual({ ok: false, errors: ['tools[0].function.name must be a non-empty string'] });
+    });
+
+    it('rejects entries whose `type` is set to something other than "function"', () => {
+      expect(validateRequestPayload('brain.toolLoop', baseToolLoopPayload([
+        { type: 'tool', function: { name: 'x' } },
+      ]))).toEqual({ ok: false, errors: ['tools[0].type must be "function" when provided'] });
+    });
+
+    it('rejects entries whose `executor` is not "local" or "remote" when provided', () => {
+      expect(validateRequestPayload('brain.toolLoop', baseToolLoopPayload([
+        { function: { name: 'x' }, executor: 'space' },
+      ]))).toEqual({ ok: false, errors: ['tools[0].executor must be "local" or "remote" when provided'] });
+      expect(validateRequestPayload('brain.toolLoop', baseToolLoopPayload([
+        { function: { name: 'x' }, executor: 7 },
+      ]))).toEqual({ ok: false, errors: ['tools[0].executor must be "local" or "remote" when provided'] });
+    });
+
+    it('rejects legacy flat-shape entries that lack the OpenAI function object', () => {
+      // Pre-rollback Space code mistakenly converted to this shape; the
+      // contract now rejects it at the boundary so a future regression
+      // is caught loudly instead of silently producing 400s from the
+      // upstream provider.
+      expect(validateRequestPayload('brain.toolLoop', baseToolLoopPayload([
+        { name: 'legacy', executor: 'remote' },
+      ]))).toEqual({ ok: false, errors: ['tools[0].function must be an object'] });
+    });
+
+    it('locks the documented validationErrors list on brain.toolLoop', () => {
+      expect(getRequestContract('brain.toolLoop').validationErrors).toStrictEqual([
+        'payload must be an object',
+        'agentId must be a UUID string',
+        'source must be a non-empty string',
+        'messages must be a non-empty array of {role,content} entries',
+        'messages[i].role must be a non-empty string',
+        'messages[i].content must be a non-empty string',
+        'tools must be an array when provided',
+        'tools[i] must be an object',
+        'tools[i].type must be "function" when provided',
+        'tools[i].function must be an object',
+        'tools[i].function.name must be a non-empty string',
+        'tools[i].executor must be "local" or "remote" when provided',
+        'toolContext must be an object when provided',
+        'maxTokens must be a positive integer when provided',
+        'maxToolRounds must be a positive integer when provided',
+        'maxToolRounds must not exceed 50',
+        'taskId must be a non-empty string when provided',
+        'skipInterruptCheck must be a boolean when provided',
+        'configOverride must be an object when provided',
+        'correlationId must be a non-empty string when provided',
+      ]);
+    });
+
+    it('locks the documented validationErrors list on brain.chatToolStream', () => {
+      expect(getRequestContract('brain.chatToolStream').validationErrors).toStrictEqual([
+        'payload must be an object',
+        'agentId must be a UUID string',
+        'source must be a non-empty string',
+        'messages must be a non-empty array of {role,content} entries',
+        'messages[i].role must be a non-empty string',
+        'messages[i].content must be a non-empty string',
+        'tools must be an array when provided',
+        'tools[i] must be an object',
+        'tools[i].type must be "function" when provided',
+        'tools[i].function must be an object',
+        'tools[i].function.name must be a non-empty string',
+        'tools[i].executor must be "local" or "remote" when provided',
+        'toolContext must be an object when provided',
+        'maxTokens must be a positive integer when provided',
+        'maxToolRounds must be a positive integer when provided',
+        'maxToolRounds must not exceed 50',
+        'taskId must be a non-empty string when provided',
+        'skipInterruptCheck must be a boolean when provided',
+        'stream must be true',
+        'configOverride must be an object when provided',
+        'backupConfigOverride must be an object when provided',
+        'correlationId must be a non-empty string when provided',
+      ]);
+    });
+  });
+
   it('detects protocol version mismatches through the handshake field', () => {
     expect(AGENT_CORE_IPC_HANDSHAKE_FIELD).toBe('agentCoreProtocolVersion');
     expect(validateHandshake({

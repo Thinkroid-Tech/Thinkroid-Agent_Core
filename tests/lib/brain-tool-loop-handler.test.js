@@ -144,7 +144,7 @@ describe('brain.toolLoop handler — request validation', () => {
     }));
     await expectJsonRpcApplicationError(
       Promise.resolve().then(() => handler(validPayload({
-        tools: [{ name: 'x', executor: 'space' }],
+        tools: [{ type: 'function', function: { name: 'x' }, executor: 'space' }],
       }), {})),
       (err) => {
         expect(err.jsonRpc.message).toContain('tools[0].executor must be');
@@ -214,7 +214,7 @@ describe('brain.toolLoop handler — single local tool round', () => {
     });
     const handler = createBrainToolLoopHandler(deps);
     const result = await handler(validPayload({
-      tools: [{ name: 'lookup', executor: 'local' }],
+      tools: [{ type: 'function', function: { name: 'lookup' }, executor: 'local' }],
     }), {});
     expect(result.status).toBe('completed');
     expect(result.text).toBe('final');
@@ -249,7 +249,7 @@ describe('brain.toolLoop handler — single remote tool round', () => {
     });
     const handler = createBrainToolLoopHandler(deps);
     const result = await handler(validPayload({
-      tools: [{ name: 'fetch', executor: 'remote' }],
+      tools: [{ type: 'function', function: { name: 'fetch' }, executor: 'remote' }],
     }), {});
     expect(result.status).toBe('completed');
     expect(deps.dispatchRemoteTool).toHaveBeenCalledTimes(1);
@@ -278,8 +278,8 @@ describe('brain.toolLoop handler — multi-round branching', () => {
     const handler = createBrainToolLoopHandler(deps);
     const result = await handler(validPayload({
       tools: [
-        { name: 'a', executor: 'local' },
-        { name: 'b', executor: 'local' },
+        { type: 'function', function: { name: 'a' }, executor: 'local' },
+        { type: 'function', function: { name: 'b' }, executor: 'local' },
       ],
     }), {});
     expect(result.status).toBe('completed');
@@ -306,7 +306,7 @@ describe('brain.toolLoop handler — maxToolRounds clamp', () => {
     });
     const handler = createBrainToolLoopHandler(deps);
     const result = await handler(validPayload({
-      tools: [{ name: 'a', executor: 'local' }],
+      tools: [{ type: 'function', function: { name: 'a' }, executor: 'local' }],
       maxToolRounds: 2,
     }), {});
     expect(result.status).toBe('failed');
@@ -331,7 +331,7 @@ describe('brain.toolLoop handler — maxToolRounds clamp', () => {
     });
     const handler = createBrainToolLoopHandler(deps);
     const result = await handler(validPayload({
-      tools: [{ name: 'a', executor: 'local' }],
+      tools: [{ type: 'function', function: { name: 'a' }, executor: 'local' }],
     }), {});
     expect(result.status).toBe('failed');
     expect(deps.dispatchLocalTool).toHaveBeenCalledTimes(25);
@@ -378,7 +378,7 @@ describe('brain.toolLoop handler — Class A tool-error envelope', () => {
     });
     const handler = createBrainToolLoopHandler(deps);
     const result = await handler(validPayload({
-      tools: [{ name: 'fetch', executor: 'remote' }],
+      tools: [{ type: 'function', function: { name: 'fetch' }, executor: 'remote' }],
     }), {});
     expect(result.status).toBe('completed');
     const toolMsg = result.conversationMessages.find((m) => m.role === 'tool');
@@ -405,7 +405,7 @@ describe('brain.toolLoop handler — kernel throw wrapping', () => {
     });
     const handler = createBrainToolLoopHandler(deps);
     const result = await handler(validPayload({
-      tools: [{ name: 'a', executor: 'local' }],
+      tools: [{ type: 'function', function: { name: 'a' }, executor: 'local' }],
     }), {});
     expect(result.status).toBe('completed');
     const toolMsg = result.conversationMessages.find((m) => m.role === 'tool');
@@ -449,7 +449,7 @@ describe('brain.toolLoop handler — APPROVAL_PENDING persists durable suspensio
     });
     const handler = createBrainToolLoopHandler(deps);
     const result = await handler(validPayload({
-      tools: [{ name: 'risky', executor: 'remote' }],
+      tools: [{ type: 'function', function: { name: 'risky' }, executor: 'remote' }],
     }), {});
 
     expect(result).toMatchObject({
@@ -500,7 +500,7 @@ describe('brain.toolLoop handler — APPROVAL_PENDING persists durable suspensio
     const handler = createBrainToolLoopHandler(deps);
     const configOverride = { provider: 'openai', model: 'gpt-test' };
     await handler(validPayload({
-      tools: [{ name: 'risky', executor: 'remote' }],
+      tools: [{ type: 'function', function: { name: 'risky' }, executor: 'remote' }],
       taskId: 'task-42',
       configOverride,
     }), {});
@@ -551,8 +551,8 @@ describe('brain.toolLoop handler — APPROVAL_PENDING persists durable suspensio
     const handler = createBrainToolLoopHandler(deps);
     const result = await handler(validPayload({
       tools: [
-        { name: 'safe', executor: 'local' },
-        { name: 'risky', executor: 'remote' },
+        { type: 'function', function: { name: 'safe' }, executor: 'local' },
+        { type: 'function', function: { name: 'risky' }, executor: 'remote' },
       ],
       maxToolRounds: 5,
     }), {});
@@ -584,7 +584,7 @@ describe('brain.toolLoop handler — APPROVAL_PENDING persists durable suspensio
     const handler = createBrainToolLoopHandler(deps);
     await expectJsonRpcApplicationError(
       Promise.resolve().then(() => handler(validPayload({
-        tools: [{ name: 'risky', executor: 'remote' }],
+        tools: [{ type: 'function', function: { name: 'risky' }, executor: 'remote' }],
       }), {})),
       (err) => {
         expect(err.jsonRpc.data).toMatchObject({
@@ -611,7 +611,7 @@ describe('brain.toolLoop handler — unknown tool reference', () => {
     const deps = makeBaseDeps({ clientFactory: factory });
     const handler = createBrainToolLoopHandler(deps);
     const result = await handler(validPayload({
-      tools: [{ name: 'real', executor: 'local' }],
+      tools: [{ type: 'function', function: { name: 'real' }, executor: 'local' }],
     }), {});
     expect(result.status).toBe('completed');
     expect(deps.dispatchLocalTool).not.toHaveBeenCalled();
@@ -647,7 +647,7 @@ describe('brain.toolLoop handler — token usage aggregation', () => {
     });
     const handler = createBrainToolLoopHandler(deps);
     const result = await handler(validPayload({
-      tools: [{ name: 'a', executor: 'local' }],
+      tools: [{ type: 'function', function: { name: 'a' }, executor: 'local' }],
     }), {});
     expect(result.status).toBe('completed');
     expect(result.usage).toEqual({
@@ -677,10 +677,13 @@ describe('brain.toolLoop handler — provider tools shape', () => {
     await handler(validPayload({
       tools: [
         {
-          name: 'lookup',
+          type: 'function',
+          function: {
+            name: 'lookup',
+            description: 'look stuff up',
+            parameters: { type: 'object', properties: {} },
+          },
           executor: 'remote',
-          description: 'look stuff up',
-          parameters: { type: 'object', properties: {} },
         },
       ],
     }), {});
@@ -688,10 +691,17 @@ describe('brain.toolLoop handler — provider tools shape', () => {
     const sentRequest = factory.create.mock.calls[0][0];
     expect(sentRequest.stream).toBe(false);
     expect(Array.isArray(sentRequest.tools)).toBe(true);
+    // Wire shape passed to the upstream OpenAI-compatible provider: the
+    // daemon's `stripExecutorFromTools` peels off only the `executor`
+    // routing discriminator and forwards the OpenAI function-calling
+    // shape verbatim.
     expect(sentRequest.tools[0]).toEqual({
-      name: 'lookup',
-      description: 'look stuff up',
-      parameters: { type: 'object', properties: {} },
+      type: 'function',
+      function: {
+        name: 'lookup',
+        description: 'look stuff up',
+        parameters: { type: 'object', properties: {} },
+      },
     });
     expect(sentRequest.tools[0]).not.toHaveProperty('executor');
   });

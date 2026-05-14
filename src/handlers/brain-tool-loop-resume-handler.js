@@ -69,6 +69,19 @@ function safeParseJson(text, fallback = null) {
   }
 }
 
+function extractToolName(tool) {
+  if (!tool || typeof tool !== 'object') return null;
+  if (
+    tool.function &&
+    typeof tool.function === 'object' &&
+    typeof tool.function.name === 'string'
+  ) {
+    return tool.function.name;
+  }
+  if (typeof tool.name === 'string') return tool.name;
+  return null;
+}
+
 function stripExecutorFromTools(tools) {
   if (!Array.isArray(tools) || tools.length === 0) return undefined;
   return tools.map((tool) => {
@@ -239,11 +252,14 @@ export function createBrainToolLoopResumeHandler({
     // does not carry tools; the loop will treat any new provider tool
     // call against an unknown name as a Class A tool-error and recover.
     const persistedToolContext = safeParseJson(row.tool_context_json, null);
+    // OpenAI function-calling shape; see brain-tool-loop-handler.js for
+    // the matching extraction comment.
     const toolsByName = new Map();
     if (Array.isArray(params.tools)) {
       for (const t of params.tools) {
-        if (t && typeof t.name === 'string') {
-          toolsByName.set(t.name, t);
+        const name = extractToolName(t);
+        if (typeof name === 'string' && name.length > 0) {
+          toolsByName.set(name, t);
         }
       }
     }

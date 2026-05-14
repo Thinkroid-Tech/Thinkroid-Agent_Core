@@ -189,7 +189,7 @@ const REQUEST_CONTRACTS = Object.freeze({
     requestShape: {
       agentId: 'UUID string',
       messages: 'non-empty array of {role,content} entries',
-      tools: 'optional array of tool definitions with {name, description?, parameters?, executor: "local"|"remote"}',
+      tools: 'optional array of OpenAI-shape tool definitions with {type?: "function", function: {name, description?, parameters?}, executor?: "local"|"remote"}',
       toolContext: 'optional object — opaque, forwarded to remote tools',
       maxTokens: 'optional positive integer',
       maxToolRounds: 'optional positive integer; default 25, hard-cap 50',
@@ -217,8 +217,11 @@ const REQUEST_CONTRACTS = Object.freeze({
       'messages[i].role must be a non-empty string',
       'messages[i].content must be a non-empty string',
       'tools must be an array when provided',
-      'tools[i] must have a non-empty string name',
-      'tools[i].executor must be "local" or "remote"',
+      'tools[i] must be an object',
+      'tools[i].type must be "function" when provided',
+      'tools[i].function must be an object',
+      'tools[i].function.name must be a non-empty string',
+      'tools[i].executor must be "local" or "remote" when provided',
       'toolContext must be an object when provided',
       'maxTokens must be a positive integer when provided',
       'maxToolRounds must be a positive integer when provided',
@@ -277,7 +280,7 @@ const REQUEST_CONTRACTS = Object.freeze({
     requestShape: {
       agentId: 'UUID string',
       messages: 'non-empty array of {role,content} entries',
-      tools: 'optional array of tool definitions with {name, description?, parameters?, executor: "local"|"remote"}',
+      tools: 'optional array of OpenAI-shape tool definitions with {type?: "function", function: {name, description?, parameters?}, executor?: "local"|"remote"}',
       toolContext: 'optional object — opaque, forwarded to remote tools',
       maxTokens: 'optional positive integer',
       maxToolRounds: 'optional positive integer; default 25, hard-cap 50',
@@ -308,8 +311,11 @@ const REQUEST_CONTRACTS = Object.freeze({
       'messages[i].role must be a non-empty string',
       'messages[i].content must be a non-empty string',
       'tools must be an array when provided',
-      'tools[i] must have a non-empty string name',
-      'tools[i].executor must be "local" or "remote"',
+      'tools[i] must be an object',
+      'tools[i].type must be "function" when provided',
+      'tools[i].function must be an object',
+      'tools[i].function.name must be a non-empty string',
+      'tools[i].executor must be "local" or "remote" when provided',
       'toolContext must be an object when provided',
       'maxTokens must be a positive integer when provided',
       'maxToolRounds must be a positive integer when provided',
@@ -827,6 +833,25 @@ function optionalArray(value, field) {
   return Array.isArray(value) ? [] : [`${field} must be an array when provided`];
 }
 
+// Validate tool definitions in the OpenAI function-calling shape:
+//
+//   { type?: 'function', function: { name, description?, parameters? },
+//     executor?: 'local' | 'remote' }
+//
+// This is the wire shape every OpenAI-compatible upstream provider expects
+// (vLLM, OpenAI, Anthropic with the OpenAI compat shim, etc.) and the shape
+// the daemon's downstream `stripExecutorFromTools` helper passes through
+// verbatim to the provider. The Space-side tool registry emits the same
+// shape with `executor: 'remote'` as the daemon-routing discriminator;
+// daemon-internal tools (e.g. `recall`) emit it with `executor: 'local'`.
+//
+// `type` is OPTIONAL — many OpenAI-compatible providers tolerate its
+// absence, and forcing callers to set it adds no real safety here. When
+// the caller does send it, it must equal `'function'` (matching the
+// OpenAI tool schema). `executor` is also OPTIONAL because tools that
+// flow through this IPC boundary already always come from Space (`remote`
+// is the only reachable value via this method); we still pin the allowed
+// set so future internal callers can't drift the daemon's routing.
 function validateBrainToolLoopTools(tools) {
   if (tools === undefined) return [];
   if (!Array.isArray(tools)) {
@@ -836,17 +861,26 @@ function validateBrainToolLoopTools(tools) {
   for (let i = 0; i < tools.length; i += 1) {
     const entry = tools[i];
     if (!isPlainObject(entry)) {
-      errors.push(`tools[${i}] must have a non-empty string name`);
+      errors.push(`tools[${i}] must be an object`);
       continue;
     }
-    if (typeof entry.name !== 'string' || entry.name.length === 0) {
-      errors.push(`tools[${i}] must have a non-empty string name`);
+    if (entry.type !== undefined && entry.type !== 'function') {
+      errors.push(`tools[${i}].type must be "function" when provided`);
+    }
+    if (!isPlainObject(entry.function)) {
+      errors.push(`tools[${i}].function must be an object`);
+    } else if (
+      typeof entry.function.name !== 'string' ||
+      entry.function.name.length === 0
+    ) {
+      errors.push(`tools[${i}].function.name must be a non-empty string`);
     }
     if (
-      typeof entry.executor !== 'string' ||
-      !BRAIN_TOOL_LOOP_EXECUTORS.includes(entry.executor)
+      entry.executor !== undefined &&
+      (typeof entry.executor !== 'string' ||
+        !BRAIN_TOOL_LOOP_EXECUTORS.includes(entry.executor))
     ) {
-      errors.push(`tools[${i}].executor must be "local" or "remote"`);
+      errors.push(`tools[${i}].executor must be "local" or "remote" when provided`);
     }
   }
   return errors;

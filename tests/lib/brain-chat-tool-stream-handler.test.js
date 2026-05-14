@@ -231,7 +231,7 @@ describe('brain.chatToolStream handler — registration + validation', () => {
     }));
     await expectJsonRpcApplicationError(
       Promise.resolve().then(() => handler(validPayload({
-        tools: [{ name: 'x', executor: 'space' }],
+        tools: [{ type: 'function', function: { name: 'x' }, executor: 'space' }],
       }), makeCtx())),
       (err) => {
         expect(err.jsonRpc.message).toContain('tools[0].executor must be');
@@ -302,7 +302,7 @@ describe('brain.chatToolStream handler — single-tool streaming', () => {
     const handler = createBrainChatToolStreamHandler(deps);
     const ctx = makeCtx();
     const result = await handler(validPayload({
-      tools: [{ name: 'lookup', executor: 'local' }],
+      tools: [{ type: 'function', function: { name: 'lookup' }, executor: 'local' }],
     }), ctx);
 
     expect(result.status).toBe('completed');
@@ -375,8 +375,8 @@ describe('brain.chatToolStream handler — multi-tool streaming within a round',
     const ctx = makeCtx();
     const result = await handler(validPayload({
       tools: [
-        { name: 'a', executor: 'local' },
-        { name: 'b', executor: 'local' },
+        { type: 'function', function: { name: 'a' }, executor: 'local' },
+        { type: 'function', function: { name: 'b' }, executor: 'local' },
       ],
     }), ctx);
 
@@ -412,7 +412,7 @@ describe('brain.chatToolStream handler — multi-round streaming', () => {
     const handler = createBrainChatToolStreamHandler(deps);
     const ctx = makeCtx();
     const result = await handler(validPayload({
-      tools: [{ name: 'a', executor: 'local' }],
+      tools: [{ type: 'function', function: { name: 'a' }, executor: 'local' }],
     }), ctx);
 
     expect(result.status).toBe('completed');
@@ -463,7 +463,7 @@ describe('brain.chatToolStream handler — approval-required mid-stream', () => 
     const handler = createBrainChatToolStreamHandler(deps);
     const ctx = makeCtx();
     const result = await handler(validPayload({
-      tools: [{ name: 'risky', executor: 'remote' }],
+      tools: [{ type: 'function', function: { name: 'risky' }, executor: 'remote' }],
     }), ctx);
 
     expect(result).toMatchObject({
@@ -618,7 +618,7 @@ describe('brain.chatToolStream handler — maxToolRounds clamp', () => {
     const handler = createBrainChatToolStreamHandler(deps);
     const ctx = makeCtx();
     const result = await handler(validPayload({
-      tools: [{ name: 'a', executor: 'local' }],
+      tools: [{ type: 'function', function: { name: 'a' }, executor: 'local' }],
       maxToolRounds: 2,
     }), ctx);
 
@@ -650,7 +650,7 @@ describe('brain.chatToolStream handler — token usage aggregation', () => {
     const handler = createBrainChatToolStreamHandler(deps);
     const ctx = makeCtx();
     const result = await handler(validPayload({
-      tools: [{ name: 'a', executor: 'local' }],
+      tools: [{ type: 'function', function: { name: 'a' }, executor: 'local' }],
     }), ctx);
 
     expect(result.status).toBe('completed');
@@ -683,7 +683,7 @@ describe('brain.chatToolStream handler — unknown tool reference', () => {
     const handler = createBrainChatToolStreamHandler(deps);
     const ctx = makeCtx();
     const result = await handler(validPayload({
-      tools: [{ name: 'real', executor: 'local' }],
+      tools: [{ type: 'function', function: { name: 'real' }, executor: 'local' }],
     }), ctx);
 
     expect(result.status).toBe('completed');
@@ -722,7 +722,7 @@ describe('brain.chatToolStream handler — kernel-throw on dispatch', () => {
     const handler = createBrainChatToolStreamHandler(deps);
     const ctx = makeCtx();
     const result = await handler(validPayload({
-      tools: [{ name: 'a', executor: 'local' }],
+      tools: [{ type: 'function', function: { name: 'a' }, executor: 'local' }],
     }), ctx);
 
     expect(result.status).toBe('completed');

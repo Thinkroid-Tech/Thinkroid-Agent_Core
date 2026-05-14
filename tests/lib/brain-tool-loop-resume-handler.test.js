@@ -478,7 +478,7 @@ describe('brain.toolLoop.resume handler — chained suspension', () => {
 
     const result = await handler({
       ...validRequest(),
-      tools: [{ name: 'second_risky', executor: 'remote' }],
+      tools: [{ type: 'function', function: { name: 'second_risky' }, executor: 'remote' }],
     }, {});
 
     expect(result.status).toBe('approval_pending');

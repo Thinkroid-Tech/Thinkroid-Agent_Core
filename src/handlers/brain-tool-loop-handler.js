@@ -81,6 +81,24 @@ function parseToolArgs(rawArguments) {
   }
 }
 
+function extractToolName(tool) {
+  if (!tool || typeof tool !== 'object') return null;
+  // OpenAI function-calling shape (the canonical wire shape).
+  if (
+    tool.function &&
+    typeof tool.function === 'object' &&
+    typeof tool.function.name === 'string'
+  ) {
+    return tool.function.name;
+  }
+  // Legacy flat shape — still tolerated for daemon-internal callers
+  // that have not been migrated yet. The contract validator rejects
+  // this shape at the IPC boundary, but tests and direct in-process
+  // callers may bypass validation, so the handler defends here too.
+  if (typeof tool.name === 'string') return tool.name;
+  return null;
+}
+
 function stripExecutorFromTools(tools) {
   if (!Array.isArray(tools) || tools.length === 0) return undefined;
   return tools.map((tool) => {
@@ -410,11 +428,18 @@ export function createBrainToolLoopHandler({
 
     // Work on a copy so we never mutate the caller's array.
     const workingMessages = params.messages.map((m) => ({ ...m }));
+    // Tool entries arrive in the OpenAI function-calling shape
+    // (`{type, function:{name,...}, executor}`). The contract validator
+    // enforces that shape at the IPC boundary, so the name lives at
+    // `tool.function.name`. We also tolerate a top-level `tool.name`
+    // (the legacy flat shape some daemon-internal callers still emit)
+    // so internal callers don't have to retrofit immediately.
     const toolsByName = new Map();
     if (Array.isArray(params.tools)) {
       for (const t of params.tools) {
-        if (t && typeof t.name === 'string') {
-          toolsByName.set(t.name, t);
+        const name = extractToolName(t);
+        if (typeof name === 'string' && name.length > 0) {
+          toolsByName.set(name, t);
         }
       }
     }

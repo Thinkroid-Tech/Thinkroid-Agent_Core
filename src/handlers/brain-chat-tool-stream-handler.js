@@ -56,6 +56,19 @@ function validateRequest(params, boundAgentId) {
   }
 }
 
+function extractToolName(tool) {
+  if (!tool || typeof tool !== 'object') return null;
+  if (
+    tool.function &&
+    typeof tool.function === 'object' &&
+    typeof tool.function.name === 'string'
+  ) {
+    return tool.function.name;
+  }
+  if (typeof tool.name === 'string') return tool.name;
+  return null;
+}
+
 function stripExecutorFromTools(tools) {
   if (!Array.isArray(tools) || tools.length === 0) return undefined;
   return tools.map((tool) => {
@@ -191,11 +204,15 @@ export function createBrainChatToolStreamHandler({
     const effectiveMaxToolRounds = Math.min(requestedRounds, HARD_CAP_MAX_TOOL_ROUNDS);
 
     const workingMessages = params.messages.map((m) => ({ ...m }));
+    // Tool entries arrive in the OpenAI function-calling shape
+    // (`{type, function:{name,...}, executor}`). See the matching
+    // comment in brain-tool-loop-handler.js for the full rationale.
     const toolsByName = new Map();
     if (Array.isArray(params.tools)) {
       for (const t of params.tools) {
-        if (t && typeof t.name === 'string') {
-          toolsByName.set(t.name, t);
+        const name = extractToolName(t);
+        if (typeof name === 'string' && name.length > 0) {
+          toolsByName.set(name, t);
         }
       }
     }
