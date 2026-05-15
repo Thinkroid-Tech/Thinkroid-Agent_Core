@@ -80,7 +80,10 @@ import { createToolInvokeHandler } from '../src/lib/daemon-tool-invoke.js';
 import { createThinkDeeper } from '../src/lib/daemon-ce-stage-4.js';
 import { createBrainChatHandler } from '../src/lib/brain-chat-handler.js';
 import { resolveAiConfig, setAiConfig } from '../src/lib/resolveAiConfig.js';
-import { registerDaemonIpcHandlers } from '../src/handlers/daemon-ipc-handlers.js';
+import {
+  registerDaemonIpcHandlers,
+  createDaemonTextChat,
+} from '../src/handlers/daemon-ipc-handlers.js';
 import { registerGovernanceDelegateHandler } from '../src/handlers/governance-delegate-handler.js';
 import { registerBrainToolLoopHandler } from '../src/handlers/brain-tool-loop-handler.js';
 import { registerBrainToolLoopResumeHandler } from '../src/handlers/brain-tool-loop-resume-handler.js';
@@ -649,6 +652,21 @@ async function main() {
   // daemon DB handles are open. These handlers use memoryClient/memDb
   // and agentCoreDb directly; registering earlier would expose request
   // methods before their backing stores exist.
+  // Wire the Cerebellum L1/L2 consolidation channel through the existing
+  // single-source daemon text shim (same provider/model resolution as the
+  // governance.delegate path). Without this the tick handlers early-return
+  // `cerebellum_channel_unavailable` and memory is never consolidated.
+  const cerebellumTextChat = createDaemonTextChat({
+    agentId,
+    brainConfig: config.brainConfig ?? null,
+    aiConfigResolver: resolveAiConfig,
+  });
+  // Channel-signature bridge: cerebellum layers call the channel with
+  // { agentId, agentName, messages, maxTokens } but the text shim only
+  // consumes messages/maxTokens (it already closes over agentId).
+  const cerebellumChannel = async ({ messages, maxTokens }) =>
+    cerebellumTextChat({ messages, maxTokens });
+
   registerDaemonIpcHandlers(kernel, {
     agentId,
     agentName: config.agentName ?? null,
@@ -658,6 +676,7 @@ async function main() {
     ipcAdapter,
     toolRegistry,
     brainConfig: config.brainConfig ?? null,
+    cerebellumChannel,
   });
 
   // Phase 16γ.B.4a Commit #2 — register the real `governance.delegate`
